@@ -1,0 +1,1669 @@
+'use strict';
+/* Presensi Guru & Staf — versi statis untuk GitHub Pages (data di IndexedDB browser). */
+
+const STATUS_LABEL = { hadir: 'Hadir', terlambat: 'Terlambat', sakit: 'Sakit', izin: 'Izin', alpa: 'Alpa' };
+const STATUS_BADGE = { hadir: 'success', terlambat: 'warning', sakit: 'info', izin: 'primary', alpa: 'danger' };
+const NAMA_BULAN = ['', 'Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni', 'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'];
+const NAMA_HARI_MULAI_SENIN = ['Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu', 'Minggu'];
+const NAMA_HARI_MULAI_MINGGU = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
+
+const $ = (s, r) => (r || document).querySelector(s);
+const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
+const esc = v => String(v == null ? '' : v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const kode = p => (p.jenis === 'guru' ? 'G' : 'S') + String(p.id).padStart(3, '0');
+const hariIni = () => isoTgl(new Date());
+const dowSenin = d => (d.getDay() + 6) % 7;            // 0 = Senin
+const parseTgl = s => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); };
+const tglIndo = s => { try { const d = parseTgl(s); return `${NAMA_HARI_MULAI_SENIN[dowSenin(d)]}, ${d.getDate()} ${NAMA_BULAN[d.getMonth() + 1]} ${d.getFullYear()}`; } catch (e) { return s; } };
+const potong = (t, n) => t && t.length > n ? t.slice(0, n) + '…' : (t || '');
+const urlPeta = (lat, lng) => `https://www.google.com/maps?q=${lat},${lng}`;
+
+// ---------- sesi & pesan ----------
+const Sesi = {
+    get() { try { return JSON.parse(sessionStorage.getItem('sesi') || 'null'); } catch (e) { return null; } },
+    set(o) { sessionStorage.setItem('sesi', JSON.stringify(o)); },
+    clear() { sessionStorage.removeItem('sesi'); }
+};
+let pesanTertunda = [];
+function flash(teks, kat) { pesanTertunda.push({ teks, kat: kat || 'info' }); }
+function htmlFlash(dismiss) {
+    const h = pesanTertunda.map(p => `<div class="alert alert-${p.kat} ${dismiss ? 'alert-dismissible fade show' : 'text-center fw-medium shadow-sm'}" role="alert">${esc(p.teks)}${dismiss ? '<button type="button" class="btn-close" data-bs-dismiss="alert"></button>' : ''}</div>`).join('');
+    pesanTertunda = [];
+    return h;
+}
+
+// ---------- modal ----------
+function tampilModal(judul, isi, opsi) {
+    opsi = opsi || {};
+    const host = $('#modalHost');
+    host.innerHTML = `<div class="modal fade" tabindex="-1"><div class="modal-dialog ${opsi.lebar || ''}"><div class="modal-content">
+        <form id="modalForm"><div class="modal-header"><h6 class="modal-title fw-bold mb-0">${judul}</h6><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body">${isi}</div>
+        ${opsi.ok === false ? '' : `<div class="modal-footer"><button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Batal</button><button type="submit" class="btn ${opsi.danger ? 'btn-danger' : 'btn-brand'} btn-sm">${opsi.ok || 'Simpan'}</button></div>`}
+        </form></div></div></div>`;
+    const el = host.firstElementChild;
+    const m = new bootstrap.Modal(el);
+    el.addEventListener('hidden.bs.modal', () => { host.innerHTML = ''; });
+    $('#modalForm', el).addEventListener('submit', async ev => {
+        ev.preventDefault();
+        if (!opsi.onOk) { m.hide(); return; }
+        const hasil = await opsi.onOk(new FormData(ev.target));
+        if (hasil !== false) m.hide();
+    });
+    m.show();
+    return m;
+}
+
+// ---------- router ----------
+const RUTE_ADMIN = {
+    '/admin': { judul: 'Dashboard', ikon: 'grid-1x2', fn: halDashboard },
+    '/perizinan': { judul: 'Perizinan', ikon: 'envelope-paper', fn: halPerizinan },
+    '/riwayat': { judul: 'Riwayat', ikon: 'clock-history', fn: halRiwayat },
+    '/pegawai': { judul: 'Guru & Staf', ikon: 'people', fn: halPegawai, admin: true },
+    '/laporan': { judul: 'Laporan', ikon: 'file-earmark-pdf', fn: halLaporan },
+    '/pengaturan': { judul: 'Pengaturan', ikon: 'sliders', fn: halPengaturan, admin: true },
+    '/akun': { judul: 'Kelola Akun', ikon: 'person-gear', fn: halAkun, admin: true }
+};
+let rutePar = {};
+
+function parseHash() {
+    const h = location.hash.replace(/^#/, '') || '/';
+    const [path, qs] = h.split('?');
+    rutePar = Object.fromEntries(new URLSearchParams(qs || ''));
+    return path || '/';
+}
+function nav(path, par) {
+    const qs = par ? '?' + new URLSearchParams(Object.entries(par).filter(([, v]) => v !== '' && v != null)).toString() : '';
+    const baru = '#' + path + (qs === '?' ? '' : qs);
+    if (location.hash === baru) render(); else location.hash = baru;
+}
+
+function bersihkanModal() {
+    $('#modalHost').innerHTML = '';
+    $$('.modal-backdrop').forEach(e => e.remove());
+    document.body.classList.remove('modal-open'); document.body.style.overflow = ''; document.body.style.paddingRight = '';
+}
+
+async function render() {
+    bersihkanModal();
+    stopKamera();
+    stopScanWajah();
+    clearInterval(window._jamTimer);
+    const path = parseHash();
+    document.body.classList.toggle('kiosk', path === '/');
+    const app = $('#app');
+    try {
+        if (path === '/') return await halKiosk(app);
+        if (path === '/login') return halLogin(app);
+        const s = Sesi.get();
+        if (!s) { flash('Silakan login terlebih dahulu.', 'warning'); return nav('/login'); }
+        const r = RUTE_ADMIN[path];
+        if (!r) return nav('/admin');
+        if (r.admin && s.role !== 'admin') { flash('Halaman ini hanya dapat diakses oleh Administrator.', 'danger'); return nav('/admin'); }
+        const konten = await r.fn();
+        const izinMenunggu = (await DB.all('perizinan')).filter(z => z.status === 'menunggu').length;
+        app.innerHTML = layoutAdmin(path, konten, s, izinMenunggu);
+        pasangLayout();
+    } catch (e) {
+        console.error(e);
+        app.innerHTML = `<div class="page-wrap"><div class="alert alert-danger">Terjadi kesalahan: ${esc(e.message)}</div></div>`;
+    }
+}
+
+function layoutAdmin(path, konten, s, izin) {
+    const tabs = Object.entries(RUTE_ADMIN).filter(([, r]) => !r.admin || s.role === 'admin').map(([p, r]) =>
+        `<a href="#${p}" class="${p === path ? 'active' : ''}"><i class="bi bi-${r.ikon}"></i>${r.judul}${p === '/perizinan' && izin ? ` <span class="badge rounded-pill text-bg-warning ms-1">${izin}</span>` : ''}</a>`).join('');
+    return `<div class="letterhead"><div class="page-wrap">
+        <div class="d-flex justify-content-between align-items-start">
+            <a href="#/admin" class="brand"><span class="seal"><i class="bi bi-shield-check"></i></span><span><span class="title d-block">Sistem Presensi Elektronik</span><span class="subtitle">Guru &amp; Tenaga Kependidikan</span></span></a>
+            <div class="d-flex align-items-center gap-2 letterhead-actions">
+                <a href="#/" target="_blank" class="btn btn-outline-light btn-sm d-flex align-items-center gap-2"><i class="bi bi-fingerprint"></i><span class="d-none d-sm-inline">Kiosk Presensi</span></a>
+                <div class="form-check form-switch mb-0 ms-1" title="Mode Gelap"><input class="form-check-input" type="checkbox" id="toggleTema"></div>
+                <div class="dropdown"><button class="btn btn-sm btn-outline-light rounded-circle dropdown-toggle" type="button" data-bs-toggle="dropdown" style="width:34px;height:34px;"><i class="bi bi-person-fill"></i></button>
+                <ul class="dropdown-menu dropdown-menu-end"><li><span class="dropdown-item-text small text-muted">${esc(s.nama)}<br>${s.role === 'kepala_sekolah' ? 'Kepala Sekolah' : 'Administrator'}</span></li><li><hr class="dropdown-divider"></li><li><a class="dropdown-item" href="#" data-act="logout"><i class="bi bi-box-arrow-right me-2"></i>Logout</a></li></ul></div>
+                <button class="btn btn-sm btn-outline-light d-md-none" id="navToggle" type="button"><i class="bi bi-list"></i></button>
+            </div>
+        </div>
+        <nav class="nav-tabs-app" id="navTabs">${tabs}</nav></div></div>
+        <main class="page-wrap">${htmlFlash(true)}${konten}</main>`;
+}
+function pasangLayout() {
+    const nt = $('#navToggle'); if (nt) nt.onclick = () => $('#navTabs').classList.toggle('open');
+    const tg = $('#toggleTema');
+    if (tg) {
+        tg.checked = (localStorage.getItem('tema') || 'light') === 'dark';
+        tg.onchange = () => { const t = tg.checked ? 'dark' : 'light'; document.documentElement.setAttribute('data-bs-theme', t); localStorage.setItem('tema', t); };
+    }
+}
+
+// ---------- aksi global (delegasi klik/submit) ----------
+document.addEventListener('click', async ev => {
+    const el = ev.target.closest('[data-act]');
+    if (!el) return;
+    ev.preventDefault();
+    const fn = AKSI[el.dataset.act];
+    if (fn) { try { await fn(el); } catch (e) { console.error(e); alert('Gagal: ' + e.message); } }
+});
+document.addEventListener('submit', async ev => {
+    const f = ev.target.closest('form[data-form]');
+    if (!f) return;
+    ev.preventDefault();
+    const fn = FORM[f.dataset.form];
+    if (fn) { try { await fn(f); } catch (e) { console.error(e); alert('Gagal: ' + e.message); } }
+});
+window.addEventListener('hashchange', render);
+
+// ============================================================
+//  LOGIN
+// ============================================================
+function halLogin(app) {
+    app.innerHTML = `<div class="page-wrap" style="max-width:420px;padding-top:60px;">
+        <div class="card-x p-4">
+            <div class="text-center mb-3"><h4 class="mb-0">Login</h4><div class="small text-muted">Administrator / Kepala Sekolah</div></div>
+            ${htmlFlash(false)}
+            <form data-form="login">
+                <div class="mb-3"><label class="form-label small">Username</label><input name="username" class="form-control" autocomplete="username" required autofocus></div>
+                <div class="mb-3"><label class="form-label small">Password</label><input type="password" name="password" class="form-control" autocomplete="current-password" required></div>
+                <button class="btn btn-brand w-100" type="submit">Masuk</button>
+            </form>
+            <div class="text-center mt-3"><a href="#/" class="small">&larr; Kembali ke Kiosk Presensi</a></div>
+        </div></div>`;
+}
+
+// ============================================================
+//  PENGENALAN WAJAH (FACE RECOGNITION AI)
+// ============================================================
+const FaceRec = {
+    modelLoaded: false,
+    loading: false,
+    modelUrls: [
+        'https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@master/weights',
+        'https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights'
+    ],
+    async init() {
+        if (this.modelLoaded) return true;
+        if (this.loading) {
+            while (this.loading) await new Promise(r => setTimeout(r, 100));
+            return this.modelLoaded;
+        }
+        this.loading = true;
+        if (typeof faceapi === 'undefined') {
+            console.error('Pustaka face-api.js belum termuat.');
+            this.loading = false;
+            return false;
+        }
+        for (const url of this.modelUrls) {
+            try {
+                await Promise.all([
+                    faceapi.nets.tinyFaceDetector.loadFromUri(url),
+                    faceapi.nets.faceLandmark68Net.loadFromUri(url),
+                    faceapi.nets.faceRecognitionNet.loadFromUri(url)
+                ]);
+                this.modelLoaded = true;
+                break;
+            } catch (e) {
+                console.warn('Gagal memuat model dari:', url, e);
+            }
+        }
+        this.loading = false;
+        return this.modelLoaded;
+    },
+    buildMatcher(daftar) {
+        if (!window.faceapi) return null;
+        const labeled = [];
+        for (const p of daftar) {
+            if (p.face_descriptor && Array.isArray(p.face_descriptor) && p.face_descriptor.length === 128) {
+                labeled.push(new faceapi.LabeledFaceDescriptors(String(p.id), [new Float32Array(p.face_descriptor)]));
+            }
+        }
+        if (!labeled.length) return null;
+        return new faceapi.FaceMatcher(labeled, 0.52);
+    },
+    async detectSingle(videoEl) {
+        if (!this.modelLoaded || !videoEl || !videoEl.videoWidth || videoEl.paused || videoEl.ended) return null;
+        try {
+            const opt = new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.5 });
+            return await faceapi.detectSingleFace(videoEl, opt).withFaceLandmarks().withFaceDescriptor();
+        } catch (e) {
+            return null;
+        }
+    },
+    async extractFromMedia(el) {
+        if (!this.modelLoaded) await this.init();
+        if (!this.modelLoaded) return null;
+        try {
+            const opt = new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.45 });
+            return await faceapi.detectSingleFace(el, opt).withFaceLandmarks().withFaceDescriptor();
+        } catch (e) {
+            console.error(e);
+            return null;
+        }
+    }
+};
+
+function bunyikanSukses() {
+    try {
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        if (!AudioCtx) return;
+        const ctx = new AudioCtx();
+        if (ctx.state === 'suspended') ctx.resume();
+        const o1 = ctx.createOscillator();
+        const g1 = ctx.createGain();
+        o1.type = 'sine';
+        o1.frequency.setValueAtTime(523.25, ctx.currentTime);
+        o1.frequency.setValueAtTime(659.25, ctx.currentTime + 0.1);
+        o1.frequency.setValueAtTime(783.99, ctx.currentTime + 0.2);
+        g1.gain.setValueAtTime(0.25, ctx.currentTime);
+        g1.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.45);
+        o1.connect(g1);
+        g1.connect(ctx.destination);
+        o1.start();
+        o1.stop(ctx.currentTime + 0.45);
+    } catch (e) {}
+}
+
+function buatFotoGeotag(v, peg, aksi) {
+    if (!v || !v.videoWidth) return null;
+    const skala = Math.min(1, 960 / v.videoWidth), c = document.createElement('canvas');
+    c.width = Math.round(v.videoWidth * skala); c.height = Math.round(v.videoHeight * skala);
+    const ctx = c.getContext('2d');
+    ctx.translate(c.width, 0); ctx.scale(-1, 1);
+    ctx.drawImage(v, 0, 0, c.width, c.height);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    
+    const n = new Date();
+    const tgl = `${n.getDate()} ${NAMA_BULAN[n.getMonth() + 1]} ${n.getFullYear()} ` + [n.getHours(), n.getMinutes(), n.getSeconds()].map(x => String(x).padStart(2, '0')).join(':');
+    const koor = K.lat !== null ? `${K.lat.toFixed(6)}, ${K.lng.toFixed(6)}` : 'Lokasi tidak tersedia';
+    const geotag = `${peg.nama} | ${aksi === 'pulang' ? 'Pulang' : 'Masuk'} (Wajah) | ${tgl} | ${koor}`;
+
+    const u = Math.max(13, Math.round(c.width / 48)), pad = Math.round(u * 0.6);
+    ctx.font = `600 ${u}px Arial, sans-serif`;
+    const baris = bungkus(ctx, geotag, c.width - pad * 2);
+    if (K.alamat) bungkus(ctx, K.alamat, c.width - pad * 2).slice(0, 2).forEach(b => baris.push(b));
+    const tinggi = baris.length * u * 1.3 + pad * 2;
+    ctx.fillStyle = 'rgba(0,0,0,0.65)'; ctx.fillRect(0, c.height - tinggi, c.width, tinggi);
+    ctx.fillStyle = '#fff'; ctx.textBaseline = 'top';
+    baris.forEach((b, i) => ctx.fillText(b, pad, c.height - tinggi + pad + i * u * 1.3));
+    return c.toDataURL('image/jpeg', 0.82);
+}
+
+// ============================================================
+//  KIOSK
+// ============================================================
+const K = {
+    lat: null, lng: null, alamat: null, pegawai: null, pin: '', aksi: null, stream: null, foto: null,
+    aksiIzin: null, pengaturan: null, semua: [],
+    mode: 'wajah', faceStream: null, faceLoopActive: false, faceMatcher: null,
+    faceAksiMode: 'auto', lastMatch: { id: null, count: 0, ts: 0 }, isProcessingPresensi: false
+};
+
+async function halKiosk(app) {
+    const [peg, set] = await Promise.all([DB.all('pegawai'), DB.pengaturan()]);
+    K.pengaturan = set;
+    K.semua = peg.filter(p => p.status === 'aktif').sort((a, b) => a.nama.localeCompare(b.nama));
+    K.pegawai = null; K.pin = '';
+    K.mode = K.mode || 'wajah';
+    app.innerHTML = `<div class="k-wrap">
+        <div class="text-center mb-3">
+            <div class="lembaga">Sistem Presensi Elektronik</div>
+            <div class="nama-sekolah">${esc(set.nama_sekolah)}</div>
+            <div class="jam" id="jamBesar">--:--:--</div><div class="tgl" id="tglBesar"></div>
+            <div id="lokStrip" class="lok-strip"><i class="bi bi-geo-alt"></i><span id="lokTeks">Mendeteksi lokasi...</span></div>
+        </div>
+        ${htmlFlash(false)}
+        <div class="mode-switch-wrap">
+            <button type="button" class="mode-switch-btn ${K.mode === 'wajah' ? 'aktif' : ''}" data-act="gantiModeKiosk" data-mode="wajah">
+                <i class="bi bi-person-bounding-box"></i> Presensi Wajah (Langsung)
+            </button>
+            <button type="button" class="mode-switch-btn ${K.mode === 'manual' ? 'aktif' : ''}" data-act="gantiModeKiosk" data-mode="manual">
+                <i class="bi bi-keyboard"></i> Presensi Manual (PIN)
+            </button>
+        </div>
+        <div class="kartu">
+            <!-- PANEL WAJAH -->
+            <div class="panel ${K.mode === 'wajah' ? 'aktif' : ''}" id="panel-wajah">
+                <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+                    <div class="small fw-semibold text-muted d-flex align-items-center gap-1">
+                        <span class="pulse-circle"></span> Pengenalan Wajah Langsung
+                    </div>
+                    <div class="d-flex gap-1" id="grupAksiWajah">
+                        <button type="button" class="aksi-selector-btn ${K.faceAksiMode === 'auto' ? 'aktif' : ''}" data-act="setAksiWajah" data-aksi="auto">⚡ Otomatis</button>
+                        <button type="button" class="aksi-selector-btn ${K.faceAksiMode === 'masuk' ? 'aktif' : ''}" data-act="setAksiWajah" data-aksi="masuk">Masuk</button>
+                        <button type="button" class="aksi-selector-btn ${K.faceAksiMode === 'pulang' ? 'aktif' : ''}" data-act="setAksiWajah" data-aksi="pulang">Pulang</button>
+                    </div>
+                </div>
+                <div class="face-scan-box" id="boxScanWajah">
+                    <video id="videoWajah" autoplay playsinline muted></video>
+                    <canvas id="canvasWajah"></canvas>
+                    <div class="face-status-pill" id="statusWajah">
+                        <div class="spinner-border spinner-border-sm text-light me-1" style="width:0.85rem;height:0.85rem;"></div>
+                        <span>Memulai kamera &amp; AI wajah...</span>
+                    </div>
+                    <div class="face-scan-target" id="targetWajah"></div>
+                    <div class="face-scan-line" id="lineWajah"></div>
+                </div>
+                <div id="hasilWajah" class="face-card-result">
+                    <div class="d-flex align-items-center justify-content-between">
+                        <div class="d-flex align-items-center gap-2">
+                            <div class="face-avatar-placeholder"><i class="bi bi-person-fill fs-5"></i></div>
+                            <div>
+                                <div class="fw-bold small" id="hasilWajahNama">Arahkan wajah ke kamera</div>
+                                <div class="text-muted" style="font-size:0.75rem;" id="hasilWajahKet">Sistem akan mengenali guru/staf secara otomatis</div>
+                            </div>
+                        </div>
+                        <div id="hasilWajahAksiArea">
+                            <span class="badge bg-secondary-subtle text-secondary" id="hasilWajahBadge">Menunggu</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="d-flex justify-content-between align-items-center mt-3 pt-2 border-top flex-wrap gap-2">
+                    <button type="button" class="btn btn-sm btn-outline-secondary" data-act="bukaDaftarWajahKiosk">
+                        <i class="bi bi-person-plus me-1"></i> Daftarkan Wajah Pegawai
+                    </button>
+                    <button type="button" class="btn btn-sm text-muted" data-act="gantiModeKiosk" data-mode="manual">
+                        Gunakan PIN Manual <i class="bi bi-arrow-right ms-1"></i>
+                    </button>
+                </div>
+            </div>
+
+            <!-- PANEL MANUAL PILIH NAMA -->
+            <div class="panel ${K.mode === 'manual' ? 'aktif' : ''}" id="panel-pilih">
+                <input type="text" id="cariNama" class="form-control" placeholder="Cari nama Anda..." style="padding:11px 14px;">
+                <div class="grid-pegawai" id="gridPegawai">${K.semua.map(p => `<div class="id-card" data-nama="${esc(p.nama.toLowerCase())}" data-act="pilihPegawai" data-id="${p.id}">
+                    ${p.face_photo ? `<img src="${p.face_photo}" style="width:34px;height:34px;border-radius:6px;object-fit:cover;flex-shrink:0;">` : `<div class="chip">${esc(p.nama[0])}</div>`}
+                    <div><div class="nama">${esc(p.nama)}</div><div class="jabatan">${p.jenis === 'guru' ? 'Guru' : 'Staf'}</div></div></div>`).join('')}</div>
+                ${K.semua.length ? '' : '<p class="text-center text-muted py-4">Belum ada data guru/staf aktif.</p>'}
+            </div>
+            <div class="panel" id="panel-pin">
+                <a class="kembali-link mb-2" data-act="kembaliPilih"><i class="bi bi-arrow-left"></i> Kembali</a>
+                <div class="text-center mb-3"><h5 class="fw-bold mb-0" id="namaTerpilih" style="color:#1c2430;"></h5><div class="text-muted small" id="statusTerpilih"></div>
+                    <div class="mt-2"><span class="badge-id"><i class="bi bi-geo-alt-fill"></i><span id="lokKartuTeks">lokasi belum terdeteksi</span></span></div></div>
+                <div class="text-center mb-3" id="pinDots"><span class="pin-dot"></span><span class="pin-dot"></span><span class="pin-dot"></span><span class="pin-dot"></span></div>
+                <div class="keypad mb-3">${[1, 2, 3, 4, 5, 6, 7, 8, 9].map(n => `<button type="button" data-act="angka" data-n="${n}">${n}</button>`).join('')}
+                    <button type="button" data-act="hapusAngka"><i class="bi bi-backspace"></i></button><button type="button" data-act="angka" data-n="0">0</button><button type="button" data-act="resetPin"><i class="bi bi-x-lg"></i></button></div>
+                <div class="aksi-grid mb-2">
+                    <button type="button" class="aksi-btn aksi-masuk" id="btnMasuk" data-act="bukaKamera" data-aksi="masuk"><i class="bi bi-box-arrow-in-right fs-4"></i>Presensi Masuk</button>
+                    <button type="button" class="aksi-btn aksi-pulang" id="btnPulang" data-act="bukaKamera" data-aksi="pulang"><i class="bi bi-box-arrow-right fs-4"></i>Presensi Pulang</button>
+                    <button type="button" class="aksi-btn aksi-izin" id="btnIzin" data-act="bukaIzin" data-aksi="izin"><i class="bi bi-envelope fs-4"></i>Ajukan Izin</button>
+                    <button type="button" class="aksi-btn aksi-sakit" id="btnSakit" data-act="bukaIzin" data-aksi="sakit"><i class="bi bi-thermometer-half fs-4"></i>Ajukan Sakit</button>
+                </div>
+            </div>
+            <div class="panel" id="panel-kamera">
+                <a class="kembali-link mb-2" data-act="tutupKamera"><i class="bi bi-arrow-left"></i> Batal</a>
+                <div class="text-center mb-2"><h5 class="fw-bold mb-0" id="judulKamera" style="color:#1c2430;"></h5><div class="text-muted small">Foto otomatis dibubuhi nama, waktu, dan koordinat lokasi (geotagging).</div></div>
+                <div class="kamera-box"><video id="kameraVideo" autoplay playsinline muted></video><img id="kameraHasil" alt="Hasil foto" style="display:none;"><div class="kamera-info" id="kameraInfo"></div></div>
+                <div id="kameraError" class="alert alert-danger small mt-2 mb-0" style="display:none;"></div>
+                <div class="d-flex gap-2 mt-3">
+                    <button type="button" class="btn btn-outline-secondary flex-fill" id="btnUlangFoto" style="display:none;" data-act="ulangFoto"><i class="bi bi-arrow-repeat me-1"></i>Foto Ulang</button>
+                    <button type="button" class="btn flex-fill" id="btnAmbilFoto" style="background:#1b3a5c;color:#fff;" data-act="ambilFoto"><i class="bi bi-camera me-1"></i>Ambil Foto</button>
+                    <button type="button" class="btn flex-fill" id="btnKirimPresensi" style="display:none;background:#2f7d4f;color:#fff;" data-act="kirimPresensi"><i class="bi bi-check-lg me-1"></i>Kirim Presensi</button>
+                </div>
+            </div>
+            <div class="panel" id="panel-keterangan">
+                <a class="kembali-link mb-2" data-act="kembaliPin"><i class="bi bi-arrow-left"></i> Kembali</a>
+                <div class="text-center mb-3"><h5 class="fw-bold mb-0" id="judulKeterangan" style="color:#1c2430;"></h5><div class="text-muted small">Pengajuan akan diteruskan ke Kepala Sekolah untuk disetujui.</div></div>
+                <div class="row g-2 mb-2"><div class="col-6"><label class="form-label small mb-1 text-dark">Tanggal Mulai</label><input type="date" id="izMulai" class="form-control"></div>
+                    <div class="col-6"><label class="form-label small mb-1 text-dark">Tanggal Selesai</label><input type="date" id="izSelesai" class="form-control"></div></div>
+                <label class="form-label small mb-1 text-dark">Alasan</label>
+                <textarea id="keteranganText" class="form-control mb-3" rows="3" placeholder="Jelaskan alasan izin/sakit (min. 5 karakter)..."></textarea>
+                <button type="button" class="btn w-100" style="background:#1b3a5c;color:#fff;border-radius:8px;padding:10px;" data-act="kirimIzin"><i class="bi bi-send me-1"></i>Kirim Pengajuan</button>
+            </div>
+        </div>
+        <div class="text-center mt-3"><a href="#/login" class="text-white-50 small">Login Admin</a></div></div>`;
+    mulaiJam(); ambilLokasi();
+    if (K.mode === 'wajah') {
+        mulaiScanWajah();
+    } else {
+        const cariEl = $('#cariNama');
+        if (cariEl) {
+            cariEl.addEventListener('input', function () {
+                const kw = this.value.toLowerCase().trim();
+                $$('.id-card').forEach(el => el.style.display = el.dataset.nama.includes(kw) ? '' : 'none');
+            });
+        }
+    }
+}
+
+function mulaiJam() {
+    const t = () => {
+        const n = new Date(), a = $('#jamBesar'); if (!a) return;
+        a.textContent = [n.getHours(), n.getMinutes(), n.getSeconds()].map(x => String(x).padStart(2, '0')).join(':');
+        $('#tglBesar').textContent = `${NAMA_HARI_MULAI_MINGGU[n.getDay()]}, ${n.getDate()} ${NAMA_BULAN[n.getMonth() + 1]} ${n.getFullYear()}`;
+    };
+    t(); window._jamTimer = setInterval(t, 1000);
+}
+function setLok(teks, kartu) { const a = $('#lokTeks'), b = $('#lokKartuTeks'); if (a) a.textContent = teks; if (b) b.textContent = kartu || teks; }
+function ambilLokasi() {
+    K.lat = K.lng = K.alamat = null;
+    if (!('geolocation' in navigator)) { setLok('Perangkat tidak mendukung lokasi', 'lokasi tidak tersedia'); $('#lokStrip').classList.add('err'); return; }
+    navigator.geolocation.getCurrentPosition(pos => {
+        K.lat = pos.coords.latitude; K.lng = pos.coords.longitude;
+        setLok(`Lokasi terdeteksi (±${Math.round(pos.coords.accuracy)} m)`, `GPS: ${K.lat.toFixed(5)}, ${K.lng.toFixed(5)}`);
+        $('#lokStrip') && $('#lokStrip').classList.remove('err');
+        fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${K.lat}&lon=${K.lng}&zoom=18`)
+            .then(r => r.ok ? r.json() : null).then(d => { if (d && d.display_name) { K.alamat = d.display_name; setLok(K.alamat, K.alamat); } }).catch(() => {});
+    }, () => { setLok('Izin lokasi ditolak', 'lokasi tidak diizinkan'); const s = $('#lokStrip'); s && s.classList.add('err'); }, { enableHighAccuracy: true, timeout: 10000 });
+}
+function panel(id) { $$('.panel').forEach(p => p.classList.remove('aktif')); $('#' + id).classList.add('aktif'); }
+function renderPin() { $$('#pinDots .pin-dot').forEach((d, i) => d.classList.toggle('terisi', i < K.pin.length)); }
+async function statusHariIni(pid) {
+    const rec = (await DB.all('presensi')).find(r => r.pegawai_id === pid && r.tanggal === hariIni());
+    return rec || null;
+}
+function jarakMeter(a1, o1, a2, o2) {
+    const R = 6371000, r = x => x * Math.PI / 180, dp = r(a2 - a1), dl = r(o2 - o1);
+    const a = Math.sin(dp / 2) ** 2 + Math.cos(r(a1)) * Math.cos(r(a2)) * Math.sin(dl / 2) ** 2;
+    return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+function batasTerlambat(jam, tol) { const [h, m] = jam.split(':').map(Number); const t = h * 60 + m + Number(tol); return t; }
+
+function kembaliKiosk(teks, kat) { flash(teks, kat); render(); window.scrollTo(0, 0); }
+
+function teksGeotag() {
+    const n = new Date();
+    const tgl = `${n.getDate()} ${NAMA_BULAN[n.getMonth() + 1]} ${n.getFullYear()} ` + [n.getHours(), n.getMinutes(), n.getSeconds()].map(x => String(x).padStart(2, '0')).join(':');
+    const koor = K.lat !== null ? `${K.lat.toFixed(6)}, ${K.lng.toFixed(6)}` : 'Lokasi tidak tersedia';
+    return `${K.pegawai.nama} | ${K.aksi === 'pulang' ? 'Pulang' : 'Masuk'} | ${tgl} | ${koor}`;
+}
+function errKamera(t) { const e = $('#kameraError'); e.textContent = t || ''; e.style.display = t ? '' : 'none'; }
+function stopKamera() { if (K.stream) { K.stream.getTracks().forEach(t => t.stop()); K.stream = null; } const v = $('#kameraVideo'); if (v) v.srcObject = null; }
+function bungkus(ctx, teks, lebar) {
+    const baris = []; let cur = '';
+    teks.split(' ').forEach(w => { const u = cur ? cur + ' ' + w : w; if (ctx.measureText(u).width > lebar && cur) { baris.push(cur); cur = w; } else cur = u; });
+    if (cur) baris.push(cur); return baris;
+}
+function resetTampilanKamera() {
+    K.foto = null; errKamera('');
+    $('#kameraVideo').style.display = ''; $('#kameraHasil').style.display = 'none';
+    $('#kameraInfo').style.display = ''; $('#kameraInfo').textContent = teksGeotag();
+    $('#btnAmbilFoto').style.display = ''; $('#btnUlangFoto').style.display = 'none'; $('#btnKirimPresensi').style.display = 'none';
+}
+
+function stopScanWajah() {
+    K.faceLoopActive = false;
+    if (K.faceStream) {
+        try { K.faceStream.getTracks().forEach(t => t.stop()); } catch (e) {}
+        K.faceStream = null;
+    }
+    const v = $('#videoWajah');
+    if (v) v.srcObject = null;
+    const c = $('#canvasWajah');
+    if (c) {
+        const ctx = c.getContext('2d');
+        ctx.clearRect(0, 0, c.width, c.height);
+    }
+}
+
+async function mulaiScanWajah() {
+    stopScanWajah();
+    K.faceLoopActive = true;
+    K.isProcessingPresensi = false;
+    K.lastMatch = { id: null, count: 0, ts: 0 };
+    
+    const pill = $('#statusWajah');
+    const v = $('#videoWajah');
+    if (!v) return;
+    
+    if (pill) pill.innerHTML = '<div class="spinner-border spinner-border-sm text-light me-1" style="width:0.85rem;height:0.85rem;"></div> Memuat model AI wajah...';
+    
+    const ok = await FaceRec.init();
+    if (!ok) {
+        if (pill) pill.innerHTML = '<i class="bi bi-exclamation-triangle-fill text-warning me-1"></i> Model AI wajah belum siap. Periksa koneksi atau gunakan PIN.';
+        return;
+    }
+    
+    K.faceMatcher = FaceRec.buildMatcher(K.semua);
+    
+    try {
+        const s = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: 'user', width: { ideal: 960 }, height: { ideal: 720 } },
+            audio: false
+        });
+        if (!K.faceLoopActive) {
+            s.getTracks().forEach(t => t.stop());
+            return;
+        }
+        K.faceStream = s;
+        v.srcObject = s;
+        if (pill) pill.innerHTML = '<i class="bi bi-camera me-1"></i> Posisikan wajah di dalam bingkai';
+        
+        loopScanWajah();
+    } catch (e) {
+        if (pill) pill.innerHTML = '<i class="bi bi-camera-video-off me-1"></i> Izin kamera tidak aktif atau kamera belum tersedia.';
+    }
+}
+
+function resetCardHasilWajah() {
+    const card = $('#hasilWajah');
+    if (!card) return;
+    card.className = 'face-card-result';
+    card.innerHTML = `
+        <div class="d-flex align-items-center justify-content-between">
+            <div class="d-flex align-items-center gap-2">
+                <div class="face-avatar-placeholder"><i class="bi bi-person-fill fs-5"></i></div>
+                <div>
+                    <div class="fw-bold small" id="hasilWajahNama">Arahkan wajah ke kamera</div>
+                    <div class="text-muted" style="font-size:0.75rem;" id="hasilWajahKet">Sistem akan mengenali guru/staf secara otomatis</div>
+                </div>
+            </div>
+            <div id="hasilWajahAksiArea">
+                <span class="badge bg-secondary-subtle text-secondary" id="hasilWajahBadge">Menunggu</span>
+            </div>
+        </div>`;
+}
+
+async function loopScanWajah() {
+    if (!K.faceLoopActive || K.isProcessingPresensi) return;
+    const v = $('#videoWajah');
+    const c = $('#canvasWajah');
+    const pill = $('#statusWajah');
+    const target = $('#targetWajah');
+    
+    if (!v || v.paused || v.ended) {
+        if (K.faceLoopActive) setTimeout(loopScanWajah, 150);
+        return;
+    }
+    
+    if (v.readyState < 2 || !v.videoWidth) {
+        if (K.faceLoopActive) setTimeout(loopScanWajah, 120);
+        return;
+    }
+    
+    if (c && (c.width !== v.clientWidth || c.height !== v.clientHeight)) {
+        c.width = v.clientWidth;
+        c.height = v.clientHeight;
+    }
+    
+    const detection = await FaceRec.detectSingle(v);
+    
+    if (!K.faceLoopActive || K.isProcessingPresensi) return;
+    
+    const ctx = c ? c.getContext('2d') : null;
+    if (ctx) ctx.clearRect(0, 0, c.width, c.height);
+    
+    if (!detection) {
+        if (target) { target.classList.remove('matched'); target.classList.remove('detecting'); }
+        if (pill) pill.innerHTML = '<i class="bi bi-camera me-1"></i> Posisikan wajah di dalam bingkai';
+        K.lastMatch = { id: null, count: 0, ts: 0 };
+        resetCardHasilWajah();
+        if (K.faceLoopActive) setTimeout(loopScanWajah, 80);
+        return;
+    }
+    
+    // Face detected
+    const scaleX = c.width / v.videoWidth;
+    const scaleY = c.height / v.videoHeight;
+    const box = detection.detection.box;
+    const bw = box.width * scaleX;
+    const bh = box.height * scaleY;
+    const bx = c.width - (box.x * scaleX + bw);
+    const by = box.y * scaleY;
+    
+    if (!K.faceMatcher) {
+        if (target) { target.classList.add('detecting'); target.classList.remove('matched'); }
+        if (ctx) {
+            ctx.strokeStyle = '#ffc107'; ctx.lineWidth = 2; ctx.strokeRect(bx, by, bw, bh);
+            ctx.fillStyle = 'rgba(255, 193, 7, 0.9)'; ctx.fillRect(bx, by - 24, Math.max(bw, 160), 24);
+            ctx.fillStyle = '#000'; ctx.font = 'bold 12px sans-serif'; ctx.fillText('Wajah Belum Terdaftar', bx + 6, by - 7);
+        }
+        if (pill) pill.innerHTML = '<i class="bi bi-exclamation-triangle-fill text-warning me-1"></i> Belum ada data wajah guru/staf terdaftar';
+        const card = $('#hasilWajah');
+        if (card) {
+            card.innerHTML = `
+                <div class="d-flex align-items-center justify-content-between">
+                    <div>
+                        <div class="fw-bold small text-warning">Wajah Terdeteksi (Belum Terdaftar)</div>
+                        <div class="text-muted" style="font-size:0.75rem;">Daftarkan wajah ini agar dapat langsung presensi</div>
+                    </div>
+                    <button type="button" class="btn btn-sm btn-outline-primary" data-act="bukaDaftarWajahKiosk">
+                        <i class="bi bi-person-plus me-1"></i> Daftarkan
+                    </button>
+                </div>`;
+        }
+        if (K.faceLoopActive) setTimeout(loopScanWajah, 120);
+        return;
+    }
+    
+    const match = K.faceMatcher.findBestMatch(detection.descriptor);
+    
+    if (match.label !== 'unknown') {
+        const peg = K.semua.find(p => p.id === Number(match.label));
+        const confidence = Math.max(50, Math.min(99, Math.round((1 - (match.distance / 0.52)) * 50 + 50)));
+        
+        if (target) { target.classList.add('matched'); target.classList.remove('detecting'); }
+        if (ctx) {
+            ctx.strokeStyle = '#28a745'; ctx.lineWidth = 3;
+            ctx.strokeRect(bx, by, bw, bh);
+            const tagW = Math.max(bw, 170);
+            ctx.fillStyle = 'rgba(40, 167, 69, 0.9)'; ctx.fillRect(bx, by - 26, tagW, 26);
+            ctx.fillStyle = '#fff'; ctx.font = 'bold 13px sans-serif';
+            ctx.fillText(`${peg ? peg.nama : 'Pegawai'} (${confidence}%)`, bx + 6, by - 8);
+        }
+        if (pill && peg) pill.innerHTML = `<i class="bi bi-check-circle-fill text-success me-1"></i> Dikenali: <strong>${esc(peg.nama)}</strong>`;
+        
+        if (peg) {
+            if (K.lastMatch.id === peg.id) {
+                K.lastMatch.count++;
+            } else {
+                K.lastMatch = { id: peg.id, count: 1, ts: Date.now() };
+            }
+            
+            const rec = await statusHariIni(peg.id);
+            let aksiOtomatis = 'masuk';
+            let bolehPresensi = true;
+            let statusBadge = '<span class="badge bg-success-subtle text-success">Siap Masuk</span>';
+            let statusKet = 'Siap melakukan Presensi Masuk';
+            
+            if (rec && (rec.status === 'izin' || rec.status === 'sakit')) {
+                statusKet = `Tercatat ${STATUS_LABEL[rec.status]} hari ini (disetujui).`;
+                statusBadge = `<span class="badge bg-info-subtle text-info">${STATUS_LABEL[rec.status]}</span>`;
+                bolehPresensi = false;
+            } else if (rec && rec.jam_pulang) {
+                statusKet = `Sudah presensi masuk (${rec.jam_masuk}) & pulang (${rec.jam_pulang}) hari ini.`;
+                statusBadge = `<span class="badge bg-secondary-subtle text-secondary">Selesai Hari Ini</span>`;
+                bolehPresensi = false;
+            } else if (rec && rec.jam_masuk) {
+                statusKet = `Sudah presensi masuk (${rec.jam_masuk}). Siap Presensi Pulang.`;
+                statusBadge = `<span class="badge bg-primary-subtle text-primary">Siap Pulang</span>`;
+                aksiOtomatis = 'pulang';
+            }
+            
+            const aksiFinal = K.faceAksiMode === 'auto' ? aksiOtomatis : K.faceAksiMode;
+            
+            const card = $('#hasilWajah');
+            if (card) {
+                card.innerHTML = `
+                    <div class="d-flex align-items-center justify-content-between">
+                        <div class="d-flex align-items-center gap-2">
+                            ${peg.face_photo ? `<img src="${peg.face_photo}" class="face-avatar">` : `<div class="face-avatar-placeholder">${esc(peg.nama[0])}</div>`}
+                            <div>
+                                <div class="fw-bold small text-dark">${esc(peg.nama)} <span class="badge bg-success-subtle text-success ms-1">${confidence}%</span></div>
+                                <div class="text-muted" style="font-size:0.75rem;">${statusKet}</div>
+                            </div>
+                        </div>
+                        <div>
+                            ${bolehPresensi ? `<button type="button" class="btn btn-sm ${aksiFinal === 'pulang' ? 'btn-info' : 'btn-success'} fw-semibold px-3" data-act="klikAbsenWajah" data-pid="${peg.id}" data-aksi="${aksiFinal}">
+                                <i class="bi ${aksiFinal === 'pulang' ? 'bi-box-arrow-right' : 'bi-box-arrow-in-right'} me-1"></i> ${aksiFinal === 'pulang' ? 'Presensi Pulang' : 'Presensi Masuk'}
+                            </button>` : statusBadge}
+                        </div>
+                    </div>`;
+            }
+            
+            // Auto-trigger presensi jika stabil minimal 2 siklus (~0.8 detik)
+            if (bolehPresensi && K.lastMatch.count >= 2) {
+                prosesPresensiWajah(peg, aksiFinal, v);
+                return;
+            }
+        }
+    } else {
+        // Unknown face
+        if (target) { target.classList.add('detecting'); target.classList.remove('matched'); }
+        if (ctx) {
+            ctx.strokeStyle = '#fd7e14'; ctx.lineWidth = 2; ctx.strokeRect(bx, by, bw, bh);
+            ctx.fillStyle = 'rgba(253, 126, 20, 0.9)'; ctx.fillRect(bx, by - 24, Math.max(bw, 160), 24);
+            ctx.fillStyle = '#fff'; ctx.font = 'bold 12px sans-serif'; ctx.fillText('Wajah Tidak Dikenali', bx + 6, by - 7);
+        }
+        if (pill) pill.innerHTML = '<i class="bi bi-question-circle-fill text-warning me-1"></i> Wajah belum terdaftar di sistem';
+        const card = $('#hasilWajah');
+        if (card) {
+            card.innerHTML = `
+                <div class="d-flex align-items-center justify-content-between">
+                    <div>
+                        <div class="fw-bold small text-warning">Wajah Tidak Dikenali</div>
+                        <div class="text-muted" style="font-size:0.75rem;">Pastikan wajah sudah didaftarkan di sistem atau gunakan presensi PIN</div>
+                    </div>
+                    <button type="button" class="btn btn-sm btn-outline-primary" data-act="bukaDaftarWajahKiosk">
+                        <i class="bi bi-person-plus me-1"></i> Daftarkan Wajah
+                    </button>
+                </div>`;
+        }
+        K.lastMatch = { id: null, count: 0, ts: 0 };
+    }
+    
+    if (K.faceLoopActive && !K.isProcessingPresensi) setTimeout(loopScanWajah, 80);
+}
+
+async function prosesPresensiWajah(peg, aksi, videoEl) {
+    if (K.isProcessingPresensi) return;
+    K.isProcessingPresensi = true;
+    
+    const statusPill = $('#statusWajah');
+    const targetBox = $('#targetWajah');
+    const cardHasil = $('#hasilWajah');
+    
+    if (statusPill) statusPill.innerHTML = `<div class="spinner-border spinner-border-sm text-light me-1" style="width:0.85rem;height:0.85rem;"></div> Memproses presensi <strong>${esc(peg.nama)}</strong>...`;
+    if (targetBox) targetBox.classList.add('matched');
+    
+    const fotoBukti = buatFotoGeotag(videoEl, peg, aksi);
+    const res = await catatPresensi(peg.id, peg.pin, aksi, fotoBukti, true);
+    
+    if (res.ok) {
+        bunyikanSukses();
+        if (cardHasil) {
+            cardHasil.className = 'face-card-result sukses animate__animated animate__fadeIn';
+            cardHasil.innerHTML = `
+                <div class="text-center py-2">
+                    <div class="d-inline-flex align-items-center justify-content-center bg-success text-white rounded-circle mb-2" style="width:48px;height:48px;">
+                        <i class="bi bi-check-lg fs-2"></i>
+                    </div>
+                    <h5 class="fw-bold mb-1 text-success">Presensi ${aksi === 'pulang' ? 'Pulang' : 'Masuk'} Berhasil!</h5>
+                    <div class="fw-bold text-dark fs-5">${esc(peg.nama)}</div>
+                    <div class="text-muted small mt-1">Pukul ${res.jam} WIB · ${res.status === 'terlambat' ? '<span class="text-warning fw-semibold">Terlambat</span>' : '<span class="text-success fw-semibold">Tepat Waktu</span>'} · Metode Wajah</div>
+                    <div class="mt-2"><span class="badge bg-light text-muted border" id="countdownReset">Melanjutkan dalam 3 detik...</span></div>
+                </div>`;
+        }
+        if (statusPill) statusPill.innerHTML = `<i class="bi bi-check-circle-fill text-success me-1"></i> Sukses: ${esc(peg.nama)}`;
+        
+        let sisa = 3;
+        const cdTimer = setInterval(() => {
+            sisa--;
+            const el = $('#countdownReset');
+            if (el) el.textContent = `Melanjutkan dalam ${sisa} detik...`;
+            if (sisa <= 0) {
+                clearInterval(cdTimer);
+                K.isProcessingPresensi = false;
+                K.lastMatch = { id: null, count: 0, ts: 0 };
+                resetCardHasilWajah();
+                if (K.faceLoopActive) loopScanWajah();
+            }
+        }, 1000);
+    } else {
+        if (cardHasil) {
+            cardHasil.className = 'face-card-result animate__animated animate__shakeX';
+            cardHasil.innerHTML = `
+                <div class="d-flex align-items-center gap-2 text-danger">
+                    <i class="bi bi-exclamation-octagon-fill fs-3"></i>
+                    <div>
+                        <div class="fw-bold">Presensi Ditolak</div>
+                        <div class="small">${esc(res.pesan)}</div>
+                    </div>
+                </div>`;
+        }
+        if (statusPill) statusPill.innerHTML = `<i class="bi bi-x-circle-fill text-danger me-1"></i> ${esc(res.pesan)}`;
+        
+        setTimeout(() => {
+            K.isProcessingPresensi = false;
+            K.lastMatch = { id: null, count: 0, ts: 0 };
+            resetCardHasilWajah();
+            if (K.faceLoopActive) loopScanWajah();
+        }, 3000);
+    }
+}
+
+async function bukaDaftarWajahKiosk() {
+    stopScanWajah();
+    await FaceRec.init();
+    const pegList = K.semua;
+    tampilModal('Daftarkan Wajah Pegawai', `
+        <div class="mb-3">
+            <label class="form-label small fw-semibold">Pilih Guru / Staf</label>
+            <select id="daftarWajahPegawaiId" class="form-select">
+                <option value="">-- Pilih Nama --</option>
+                ${pegList.map(p => `<option value="${p.id}">${esc(p.nama)} (${p.jenis === 'guru' ? 'Guru' : 'Staf'}) ${p.face_descriptor ? '✓ [Sudah Terdaftar]' : ''}</option>`).join('')}
+            </select>
+        </div>
+        <div class="mb-3">
+            <label class="form-label small fw-semibold">PIN (4 digit)</label>
+            <input type="password" id="daftarWajahPin" class="form-control" maxlength="4" placeholder="Masukkan PIN pegawai...">
+            <div class="form-text small">Diperlukan verifikasi PIN pegawai untuk keamanan pendaftaran wajah.</div>
+        </div>
+        <div class="kamera-box mb-3" style="aspect-ratio:4/3;max-height:280px;">
+            <video id="videoRegWajah" autoplay playsinline muted></video>
+            <canvas id="canvasRegWajah" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;"></canvas>
+            <div class="kamera-info" id="infoRegWajah">Memulai kamera...</div>
+        </div>
+        <div id="statusDeteksiReg" class="alert alert-secondary small py-2 mb-0 text-center">
+            <i class="bi bi-camera me-1"></i> Arahkan wajah lurus ke kamera
+        </div>
+        <div class="mt-3 text-end d-flex gap-2 justify-content-end">
+            <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Batal</button>
+            <button type="button" class="btn btn-primary btn-sm" id="btnSimpanWajah" disabled>
+                <i class="bi bi-camera-fill me-1"></i> Ambil &amp; Simpan Wajah
+            </button>
+        </div>
+    `, { ok: false, lebar: 'modal-md' });
+
+    let stream = null;
+    let regLoop = true;
+    let latestDetection = null;
+
+    try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+        const v = $('#videoRegWajah');
+        if (v) v.srcObject = stream;
+    } catch (e) {
+        const inf = $('#infoRegWajah'); if (inf) inf.textContent = 'Gagal mengakses kamera: ' + e.message;
+        return;
+    }
+
+    const modalEl = $('#modalHost .modal');
+    modalEl.addEventListener('hidden.bs.modal', () => {
+        regLoop = false;
+        if (stream) stream.getTracks().forEach(t => t.stop());
+        if (K.mode === 'wajah') mulaiScanWajah();
+    });
+
+    const loopReg = async () => {
+        if (!regLoop) return;
+        const v = $('#videoRegWajah');
+        const c = $('#canvasRegWajah');
+        const info = $('#statusDeteksiReg');
+        const btn = $('#btnSimpanWajah');
+        if (v && v.readyState >= 2 && v.videoWidth) {
+            if (c && (c.width !== v.clientWidth || c.height !== v.clientHeight)) {
+                c.width = v.clientWidth; c.height = v.clientHeight;
+            }
+            const detection = await FaceRec.detectSingle(v);
+            if (c) {
+                const ctx = c.getContext('2d');
+                ctx.clearRect(0, 0, c.width, c.height);
+                if (detection) {
+                    latestDetection = detection;
+                    const scaleX = c.width / v.videoWidth, scaleY = c.height / v.videoHeight;
+                    const box = detection.detection.box;
+                    const bw = box.width * scaleX, bh = box.height * scaleY;
+                    const bx = c.width - (box.x * scaleX + bw), by = box.y * scaleY;
+                    ctx.strokeStyle = '#28a745'; ctx.lineWidth = 3;
+                    ctx.strokeRect(bx, by, bw, bh);
+                    if (info) {
+                        info.className = 'alert alert-success small py-2 mb-0 text-center';
+                        info.innerHTML = '<i class="bi bi-check-circle-fill me-1"></i> Wajah terdeteksi dengan baik. Siap diambil!';
+                    }
+                    if (btn) btn.disabled = false;
+                } else {
+                    latestDetection = null;
+                    if (info) {
+                        info.className = 'alert alert-secondary small py-2 mb-0 text-center';
+                        info.innerHTML = '<i class="bi bi-camera me-1"></i> Posisikan wajah di tengah bingkai...';
+                    }
+                    if (btn) btn.disabled = true;
+                }
+            }
+        }
+        if (regLoop) setTimeout(loopReg, 150);
+    };
+    loopReg();
+
+    $('#btnSimpanWajah').addEventListener('click', async () => {
+        const pid = Number($('#daftarWajahPegawaiId').value);
+        const pin = ($('#daftarWajahPin').value || '').trim();
+        if (!pid) { alert('Pilih guru atau staf.'); return; }
+        const p = await DB.get('pegawai', pid);
+        if (!p) { alert('Data pegawai tidak ditemukan.'); return; }
+        if (p.pin !== pin) { alert('PIN salah. Verifikasi gagal.'); return; }
+        if (!latestDetection) { alert('Wajah belum terdeteksi. Lihat ke kamera.'); return; }
+
+        const v = $('#videoRegWajah');
+        const sc = document.createElement('canvas');
+        sc.width = 160; sc.height = 160;
+        const sctx = sc.getContext('2d');
+        sctx.translate(160, 0); sctx.scale(-1, 1);
+        sctx.drawImage(v, 0, 0, 160, 160);
+        const fotoThumbnail = sc.toDataURL('image/jpeg', 0.85);
+
+        p.face_descriptor = Array.from(latestDetection.descriptor);
+        p.face_photo = fotoThumbnail;
+        await DB.put('pegawai', p);
+
+        const idx = K.semua.findIndex(x => x.id === p.id);
+        if (idx !== -1) K.semua[idx] = p;
+        K.faceMatcher = FaceRec.buildMatcher(K.semua);
+
+        bootstrap.Modal.getInstance(modalEl).hide();
+        flash(`Wajah '${p.nama}' berhasil didaftarkan! Sekarang dapat langsung absen dengan wajah.`, 'success');
+        render();
+    });
+}
+
+async function bukaDaftarWajahAdmin(pid) {
+    await FaceRec.init();
+    const p = await DB.get('pegawai', Number(pid));
+    if (!p) return;
+    const sudahAda = !!(p.face_descriptor && p.face_descriptor.length === 128);
+
+    tampilModal(`Kelola Wajah — ${esc(p.nama)}`, `
+        <div class="text-center mb-3">
+            ${p.face_photo ? `<img src="${p.face_photo}" class="rounded-circle border mb-2 shadow-sm" style="width:70px;height:70px;object-fit:cover;">` : '<div class="avatar-placeholder mx-auto mb-2"><i class="bi bi-person-fill fs-3"></i></div>'}
+            <div class="fw-bold">${esc(p.nama)}</div>
+            <div class="small text-muted">${kode(p)} · ${p.jenis === 'guru' ? 'Guru' : 'Staf'}</div>
+            <div class="mt-1">${sudahAda ? '<span class="badge bg-success-subtle text-success border border-success-subtle"><i class="bi bi-check-circle-fill me-1"></i>Wajah Terdaftar</span>' : '<span class="badge bg-secondary-subtle text-secondary border">Belum Ada Data Wajah</span>'}</div>
+        </div>
+
+        <ul class="nav nav-pills nav-fill mb-3" id="tabDaftarWajah">
+            <li class="nav-item"><a class="nav-link active py-1" id="tabCamLink" data-bs-toggle="pill" href="#tabCam"><i class="bi bi-camera me-1"></i>Webcam</a></li>
+            <li class="nav-item"><a class="nav-link py-1" id="tabFileLink" data-bs-toggle="pill" href="#tabFile"><i class="bi bi-upload me-1"></i>Unggah Foto</a></li>
+        </ul>
+
+        <div class="tab-content">
+            <div class="tab-pane fade show active" id="tabCam">
+                <div class="kamera-box mb-2" style="aspect-ratio:4/3;max-height:260px;">
+                    <video id="adminRegVideo" autoplay playsinline muted></video>
+                    <canvas id="adminRegCanvas" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;"></canvas>
+                    <div class="kamera-info" id="adminRegInfo">Memulai kamera...</div>
+                </div>
+                <div id="adminDeteksiStatus" class="alert alert-secondary small py-2 mb-2 text-center">
+                    <i class="bi bi-camera me-1"></i> Arahkan wajah pegawai ke kamera
+                </div>
+                <button type="button" class="btn btn-primary w-100" id="btnAdminSimpanCam" disabled>
+                    <i class="bi bi-camera-fill me-1"></i> Ambil &amp; Simpan dari Kamera
+                </button>
+            </div>
+            <div class="tab-pane fade" id="tabFile">
+                <div class="mb-3">
+                    <label class="form-label small fw-semibold">Pilih File Foto (Pasfoto / Foto Wajah Jelas)</label>
+                    <input type="file" id="inputFotoPegawai" class="form-control" accept="image/*">
+                </div>
+                <div id="previewFotoArea" class="text-center p-3 border rounded mb-3 bg-light" style="display:none;">
+                    <img id="imgPreviewWajah" class="rounded mb-2" style="max-height:200px;max-width:100%;">
+                    <div id="statusDeteksiFoto" class="small fw-semibold"></div>
+                </div>
+                <button type="button" class="btn btn-primary w-100" id="btnAdminSimpanFile" disabled>
+                    <i class="bi bi-check-lg me-1"></i> Gunakan Foto Ini
+                </button>
+            </div>
+        </div>
+
+        ${sudahAda ? `
+            <hr class="my-3">
+            <div class="d-flex justify-content-between align-items-center">
+                <span class="small text-muted">Ingin menghapus data wajah ini?</span>
+                <button type="button" class="btn btn-outline-danger btn-sm" id="btnAdminHapusWajah">
+                    <i class="bi bi-trash me-1"></i> Hapus Data Wajah
+                </button>
+            </div>
+        ` : ''}
+    `, { ok: false, lebar: 'modal-md' });
+
+    let stream = null;
+    let loopActive = true;
+    let latestCamDetection = null;
+    let latestFileDetection = null;
+    let fileThumbnail = null;
+
+    try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+        const v = $('#adminRegVideo');
+        if (v) v.srcObject = stream;
+    } catch (e) {
+        const inf = $('#adminRegInfo'); if (inf) inf.textContent = 'Gagal mengakses kamera: ' + e.message;
+    }
+
+    const modalEl = $('#modalHost .modal');
+    modalEl.addEventListener('hidden.bs.modal', () => {
+        loopActive = false;
+        if (stream) stream.getTracks().forEach(t => t.stop());
+    });
+
+    const loopAdmin = async () => {
+        if (!loopActive) return;
+        const v = $('#adminRegVideo');
+        const c = $('#adminRegCanvas');
+        const info = $('#adminDeteksiStatus');
+        const btn = $('#btnAdminSimpanCam');
+        if (v && v.readyState >= 2 && v.videoWidth) {
+            if (c && (c.width !== v.clientWidth || c.height !== v.clientHeight)) {
+                c.width = v.clientWidth; c.height = v.clientHeight;
+            }
+            const detection = await FaceRec.detectSingle(v);
+            if (c) {
+                const ctx = c.getContext('2d');
+                ctx.clearRect(0, 0, c.width, c.height);
+                if (detection) {
+                    latestCamDetection = detection;
+                    const scaleX = c.width / v.videoWidth, scaleY = c.height / v.videoHeight;
+                    const box = detection.detection.box;
+                    const bw = box.width * scaleX, bh = box.height * scaleY;
+                    const bx = c.width - (box.x * scaleX + bw), by = box.y * scaleY;
+                    ctx.strokeStyle = '#28a745'; ctx.lineWidth = 3;
+                    ctx.strokeRect(bx, by, bw, bh);
+                    if (info) {
+                        info.className = 'alert alert-success small py-2 mb-2 text-center';
+                        info.innerHTML = '<i class="bi bi-check-circle-fill me-1"></i> Wajah terdeteksi! Kualitas baik.';
+                    }
+                    if (btn) btn.disabled = false;
+                } else {
+                    latestCamDetection = null;
+                    if (info) {
+                        info.className = 'alert alert-secondary small py-2 mb-2 text-center';
+                        info.innerHTML = '<i class="bi bi-camera me-1"></i> Posisikan wajah di tengah bingkai...';
+                    }
+                    if (btn) btn.disabled = true;
+                }
+            }
+        }
+        if (loopActive) setTimeout(loopAdmin, 150);
+    };
+    loopAdmin();
+
+    $('#btnAdminSimpanCam').addEventListener('click', async () => {
+        if (!latestCamDetection) return;
+        const v = $('#adminRegVideo');
+        const sc = document.createElement('canvas');
+        sc.width = 160; sc.height = 160;
+        const sctx = sc.getContext('2d');
+        sctx.translate(160, 0); sctx.scale(-1, 1);
+        sctx.drawImage(v, 0, 0, 160, 160);
+        const fotoThumbnail = sc.toDataURL('image/jpeg', 0.85);
+
+        p.face_descriptor = Array.from(latestCamDetection.descriptor);
+        p.face_photo = fotoThumbnail;
+        await DB.put('pegawai', p);
+
+        bootstrap.Modal.getInstance(modalEl).hide();
+        flash(`Data wajah '${p.nama}' berhasil disimpan!`, 'success');
+        render();
+    });
+
+    $('#inputFotoPegawai').addEventListener('change', function () {
+        const f = this.files[0];
+        if (!f) return;
+        const reader = new FileReader();
+        reader.onload = async ev => {
+            const img = new Image();
+            img.onload = async () => {
+                const previewArea = $('#previewFotoArea');
+                const imgEl = $('#imgPreviewWajah');
+                const statusEl = $('#statusDeteksiFoto');
+                const btnFile = $('#btnAdminSimpanFile');
+                previewArea.style.display = 'block';
+                imgEl.src = img.src;
+                statusEl.className = 'small text-muted';
+                statusEl.innerHTML = '<div class="spinner-border spinner-border-sm me-1"></div> Menganalisis wajah...';
+                btnFile.disabled = true;
+
+                const detection = await FaceRec.extractFromMedia(img);
+                if (detection) {
+                    latestFileDetection = detection;
+                    fileThumbnail = img.src;
+                    statusEl.className = 'small text-success fw-bold';
+                    statusEl.innerHTML = '<i class="bi bi-check-circle-fill me-1"></i> Wajah terdeteksi pada foto!';
+                    btnFile.disabled = false;
+                } else {
+                    latestFileDetection = null;
+                    statusEl.className = 'small text-danger fw-bold';
+                    statusEl.innerHTML = '<i class="bi bi-x-circle-fill me-1"></i> Tidak dapat mendeteksi wajah pada foto ini. Gunakan foto lain yang lebih jelas.';
+                    btnFile.disabled = true;
+                }
+            };
+            img.src = ev.target.result;
+        };
+        reader.readAsDataURL(f);
+    });
+
+    $('#btnAdminSimpanFile').addEventListener('click', async () => {
+        if (!latestFileDetection) return;
+        p.face_descriptor = Array.from(latestFileDetection.descriptor);
+        p.face_photo = fileThumbnail;
+        await DB.put('pegawai', p);
+
+        bootstrap.Modal.getInstance(modalEl).hide();
+        flash(`Data wajah '${p.nama}' dari foto berhasil disimpan!`, 'success');
+        render();
+    });
+
+    const btnHapus = $('#btnAdminHapusWajah');
+    if (btnHapus) {
+        btnHapus.addEventListener('click', async () => {
+            if (!confirm(`Hapus data pengenalan wajah untuk '${p.nama}'?`)) return;
+            p.face_descriptor = null;
+            p.face_photo = null;
+            await DB.put('pegawai', p);
+            bootstrap.Modal.getInstance(modalEl).hide();
+            flash(`Data wajah '${p.nama}' dihapus.`, 'info');
+            render();
+        });
+    }
+}
+
+const AKSI = {
+    logout() { Sesi.clear(); flash('Anda telah logout.', 'info'); nav('/login'); },
+
+    gantiModeKiosk(el) {
+        const mode = el.dataset.mode;
+        K.mode = mode;
+        if (mode === 'manual') stopScanWajah();
+        render();
+    },
+    setAksiWajah(el) {
+        K.faceAksiMode = el.dataset.aksi;
+        $$('.aksi-selector-btn').forEach(b => b.classList.toggle('aktif', b === el));
+    },
+    async bukaDaftarWajahKiosk() {
+        await bukaDaftarWajahKiosk();
+    },
+    async bukaDaftarWajahAdmin(el) {
+        await bukaDaftarWajahAdmin(el.dataset.id);
+    },
+    klikAbsenWajah(el) {
+        const pid = Number(el.dataset.pid);
+        const aksi = el.dataset.aksi;
+        const peg = K.semua.find(p => p.id === pid);
+        const v = $('#videoWajah');
+        if (peg && v) prosesPresensiWajah(peg, aksi, v);
+    },
+
+    // ---- kiosk ----
+    async pilihPegawai(el) {
+        const id = Number(el.dataset.id);
+        K.pegawai = K.semua.find(p => p.id === id); K.pin = ''; renderPin();
+        $('#namaTerpilih').textContent = K.pegawai.nama; $('#statusTerpilih').textContent = 'Memuat status hari ini...';
+        panel('panel-pin');
+        const rec = await statusHariIni(id);
+        const bM = $('#btnMasuk'), bP = $('#btnPulang'); $('#btnIzin').disabled = $('#btnSakit').disabled = false;
+        let ket;
+        if (rec && (rec.status === 'izin' || rec.status === 'sakit')) { ket = `Hari ini tercatat ${STATUS_LABEL[rec.status]} (disetujui).`; bM.disabled = bP.disabled = true; }
+        else if (rec && rec.jam_pulang) { ket = 'Sudah presensi masuk & pulang hari ini. Sampai jumpa besok!'; bM.disabled = bP.disabled = true; }
+        else if (rec && rec.jam_masuk) { ket = 'Sudah presensi masuk. Silakan presensi pulang saat jam pulang.'; bM.disabled = true; bP.disabled = false; }
+        else { ket = 'Belum presensi hari ini.'; bM.disabled = false; bP.disabled = true; }
+        $('#statusTerpilih').textContent = ket;
+    },
+    kembaliPilih() { K.pin = ''; renderPin(); panel('panel-pilih'); },
+    kembaliPin() { panel('panel-pin'); },
+    angka(el) { if (K.pin.length < 4) { K.pin += el.dataset.n; renderPin(); } },
+    hapusAngka() { K.pin = K.pin.slice(0, -1); renderPin(); },
+    resetPin() { K.pin = ''; renderPin(); },
+
+    bukaKamera(el) {
+        if (K.pin.length !== 4) { alert('Masukkan PIN 4 digit terlebih dahulu.'); return; }
+        K.aksi = el.dataset.aksi;
+        $('#judulKamera').textContent = `Presensi ${K.aksi === 'masuk' ? 'Masuk' : 'Pulang'} - ${K.pegawai.nama}`;
+        panel('panel-kamera'); resetTampilanKamera();
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            errKamera('Kamera tidak tersedia. Buka lewat HTTPS dan gunakan browser yang mendukung kamera.'); $('#btnAmbilFoto').style.display = 'none'; return;
+        }
+        navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 960 }, height: { ideal: 720 } }, audio: false })
+            .then(s => { K.stream = s; $('#kameraVideo').srcObject = s; })
+            .catch(() => { errKamera('Izin kamera ditolak. Aktifkan izin kamera di browser lalu coba lagi.'); $('#btnAmbilFoto').style.display = 'none'; });
+    },
+    tutupKamera() { stopKamera(); panel('panel-pin'); },
+    ambilFoto() {
+        const v = $('#kameraVideo');
+        if (!v.videoWidth) { errKamera('Kamera belum siap, tunggu sebentar.'); return; }
+        const skala = Math.min(1, 960 / v.videoWidth), c = document.createElement('canvas');
+        c.width = Math.round(v.videoWidth * skala); c.height = Math.round(v.videoHeight * skala);
+        const ctx = c.getContext('2d'); ctx.drawImage(v, 0, 0, c.width, c.height);
+        const u = Math.max(13, Math.round(c.width / 48)), pad = Math.round(u * 0.6);
+        ctx.font = `600 ${u}px Arial, sans-serif`;
+        const baris = bungkus(ctx, teksGeotag(), c.width - pad * 2);
+        if (K.alamat) bungkus(ctx, K.alamat, c.width - pad * 2).slice(0, 2).forEach(b => baris.push(b));
+        const tinggi = baris.length * u * 1.3 + pad * 2;
+        ctx.fillStyle = 'rgba(0,0,0,0.62)'; ctx.fillRect(0, c.height - tinggi, c.width, tinggi);
+        ctx.fillStyle = '#fff'; ctx.textBaseline = 'top';
+        baris.forEach((b, i) => ctx.fillText(b, pad, c.height - tinggi + pad + i * u * 1.3));
+        K.foto = c.toDataURL('image/jpeg', 0.8);
+        const img = $('#kameraHasil'); img.src = K.foto; img.style.display = ''; v.style.display = 'none'; $('#kameraInfo').style.display = 'none';
+        $('#btnAmbilFoto').style.display = 'none'; $('#btnUlangFoto').style.display = ''; $('#btnKirimPresensi').style.display = '';
+    },
+    ulangFoto() { resetTampilanKamera(); },
+    async kirimPresensi() {
+        if (!K.foto) { errKamera('Ambil foto terlebih dahulu.'); return; }
+        const foto = K.foto; stopKamera();
+        const res = await catatPresensi(K.pegawai.id, K.pin, K.aksi, foto, false);
+        kembaliKiosk(res.pesan, res.kat);
+    },
+    bukaIzin(el) {
+        if (K.pin.length !== 4) { alert('Masukkan PIN 4 digit terlebih dahulu.'); return; }
+        K.aksiIzin = el.dataset.aksi;
+        $('#judulKeterangan').textContent = `Pengajuan ${K.aksiIzin === 'izin' ? 'Izin' : 'Sakit'} - ${K.pegawai.nama}`;
+        $('#keteranganText').value = ''; $('#izMulai').value = $('#izSelesai').value = hariIni(); panel('panel-keterangan');
+    },
+    async kirimIzin() {
+        const teks = $('#keteranganText').value.trim(), mulai = $('#izMulai').value, selesai = $('#izSelesai').value || mulai;
+        if (!mulai) { alert('Isi tanggal mulai.'); return; }
+        if (selesai < mulai) { alert('Tanggal selesai tidak boleh sebelum tanggal mulai.'); return; }
+        if (teks.length < 5) { alert('Mohon isi alasan (minimal 5 karakter).'); return; }
+        await ajukanIzin(K.pegawai.id, K.pin, K.aksiIzin, mulai, selesai, teks);
+    },
+
+    // ---- admin ----
+    async hapusPegawai(el) {
+        const p = await DB.get('pegawai', Number(el.dataset.id));
+        tampilModal('Hapus Data', `<p class="mb-0">Hapus data <strong>${esc(p.nama)}</strong>? Seluruh riwayat presensi dan pengajuannya juga akan terhapus.</p>`, {
+            ok: 'Ya, Hapus', danger: true, onOk: async () => {
+                for (const r of await DB.all('presensi')) if (r.pegawai_id === p.id) await DB.del('presensi', r.id);
+                for (const z of await DB.all('perizinan')) if (z.pegawai_id === p.id) await DB.del('perizinan', z.id);
+                await DB.del('pegawai', p.id); flash(`Data '${p.nama}' berhasil dihapus.`, 'success'); render();
+            }
+        });
+    },
+    formPegawai(el) { return bukaFormPegawai(el.dataset.id ? Number(el.dataset.id) : null); },
+    async lihatFoto(el) {
+        tampilModal(esc(el.dataset.judul || 'Foto Presensi'), `<img class="foto-besar" src="${el.dataset.src}" alt="Foto presensi">`, { ok: false, lebar: 'modal-lg' });
+    },
+    async prosesIzin(el) {
+        const z = await DB.get('perizinan', Number(el.dataset.id)), p = await DB.get('pegawai', z.pegawai_id);
+        tampilModal('Proses Pengajuan', `<p class="small mb-2"><strong>${esc(p.nama)}</strong> — ${STATUS_LABEL[z.jenis]}<br>${tglIndo(z.tanggal_mulai)}${z.tanggal_selesai !== z.tanggal_mulai ? ' s/d ' + tglIndo(z.tanggal_selesai) : ''}<br><em>${esc(z.alasan)}</em></p>
+            <label class="form-label small">Catatan (opsional)</label><textarea name="catatan" class="form-control" rows="2"></textarea>
+            <div class="d-flex gap-2 mt-3"><button type="submit" name="keputusan" value="tolak" class="btn btn-outline-danger flex-fill" data-k="tolak">Tolak</button><button type="submit" name="keputusan" value="setuju" class="btn btn-success flex-fill" data-k="setuju">Setujui</button></div>`, {
+            ok: false, onOk: null
+        });
+        $$('#modalForm button[data-k]').forEach(b => b.addEventListener('click', ev => {
+            ev.preventDefault(); ev.stopPropagation();
+            const catatan = $('#modalForm [name=catatan]').value.trim() || null;
+            bootstrap.Modal.getInstance($('#modalHost .modal')).hide();
+            putuskanIzin(z.id, b.dataset.k, catatan);
+        }));
+    },
+    async hapusAkun(el) {
+        const u = await DB.get('users', Number(el.dataset.id));
+        if (u.id === Sesi.get().id) { flash('Tidak dapat menghapus akun yang sedang digunakan.', 'danger'); render(); return; }
+        const sisa = (await DB.all('users')).filter(x => x.role === 'admin' && x.id !== u.id).length;
+        if (u.role === 'admin' && sisa === 0) { flash('Minimal harus ada satu akun Administrator.', 'danger'); render(); return; }
+        tampilModal('Hapus Akun', `<p class="mb-0">Hapus akun <strong>${esc(u.username)}</strong>?</p>`, { ok: 'Ya, Hapus', danger: true, onOk: async () => { await DB.del('users', u.id); flash('Akun dihapus.', 'success'); render(); } });
+    },
+    async resetAkun(el) {
+        const u = await DB.get('users', Number(el.dataset.id));
+        tampilModal('Reset Password', `<p class="small">Akun <strong>${esc(u.username)}</strong></p><input type="password" name="pw" class="form-control" placeholder="Password baru (min. 4 karakter)" required minlength="4">`, {
+            onOk: async fd => {
+                const pw = fd.get('pw'); const salt = acakSalt(); u.salt = salt; u.hash = await hashPassword(pw, salt);
+                await DB.put('users', u); flash(`Password '${u.username}' diganti.`, 'success'); render();
+            }
+        });
+    },
+    async unduhPdf() { await unduhLaporanPdf(); },
+    async cadangkan() {
+        const dump = {}; for (const s of STORES) dump[s] = await DB.all(s);
+        const blob = new Blob([JSON.stringify(dump)], { type: 'application/json' });
+        const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `cadangan-presensi-${hariIni()}.json`; a.click();
+    },
+    pulihkan() { $('#fileCadangan').click(); },
+    async resetData() {
+        tampilModal('Hapus Semua Data', '<p class="mb-0">Seluruh data presensi, pegawai, pengajuan, dan akun di browser ini akan dihapus lalu dikembalikan ke data awal. Lanjutkan?</p>', {
+            ok: 'Ya, Reset', danger: true, onOk: async () => {
+                for (const s of STORES) await DB.clear(s);
+                await seedAwal(); Sesi.clear(); flash('Data direset ke kondisi awal.', 'warning'); nav('/login');
+            }
+        });
+    },
+    gunakanLokasi() {
+        if (!navigator.geolocation) { alert('Perangkat ini tidak mendukung lokasi.'); return; }
+        navigator.geolocation.getCurrentPosition(pos => {
+            $('#sekolahLat').value = pos.coords.latitude.toFixed(6); $('#sekolahLng').value = pos.coords.longitude.toFixed(6);
+        }, () => alert('Gagal mengambil lokasi. Pastikan izin lokasi diaktifkan.'), { enableHighAccuracy: true, timeout: 10000 });
+    }
+};
+
+const FORM = {
+    async login(f) {
+        const fd = new FormData(f), uname = fd.get('username').trim().toLowerCase();
+        const u = (await DB.all('users')).find(x => x.username === uname);
+        if (u && (await hashPassword(fd.get('password'), u.salt)) === u.hash) {
+            Sesi.set({ id: u.id, username: u.username, nama: u.nama_lengkap, role: u.role });
+            flash(`Selamat datang, ${u.nama_lengkap}.`, 'success'); nav('/admin');
+        } else { flash('Username atau password salah.', 'danger'); render(); }
+    },
+    filter(f) { const par = Object.fromEntries(new FormData(f)); nav(f.dataset.rute, par); },
+    async pengaturan(f) {
+        const fd = new FormData(f);
+        await DB.simpanPengaturan({
+            nama_sekolah: (fd.get('nama_sekolah') || '').trim() || 'Sekolah Kita', jam_masuk_standar: fd.get('jam_masuk_standar') || '07:30',
+            toleransi_menit: fd.get('toleransi_menit') || '15', sekolah_lat: (fd.get('sekolah_lat') || '').trim(), sekolah_lng: (fd.get('sekolah_lng') || '').trim(),
+            radius_meter: (fd.get('radius_meter') || '0').trim() || '0', nama_kepala_sekolah: (fd.get('nama_kepala_sekolah') || '').trim(),
+            nip_kepala_sekolah: (fd.get('nip_kepala_sekolah') || '').trim(), kota: (fd.get('kota') || '').trim()
+        });
+        flash('Pengaturan berhasil disimpan.', 'success'); render();
+    },
+    async akunBaru(f) {
+        const fd = new FormData(f), username = fd.get('username').trim().toLowerCase(), pw = fd.get('password'), nama = fd.get('nama_lengkap').trim();
+        let role = fd.get('role'); if (!['admin', 'kepala_sekolah'].includes(role)) role = 'admin';
+        if (!username || !pw || !nama) flash('Username, nama lengkap, dan password wajib diisi.', 'danger');
+        else if (pw.length < 4) flash('Password minimal 4 karakter.', 'danger');
+        else if ((await DB.all('users')).some(u => u.username === username)) flash(`Username '${username}' sudah digunakan.`, 'danger');
+        else { await DB.put('users', await buatUser(username, pw, nama, role)); flash(`Akun '${username}' berhasil dibuat.`, 'success'); }
+        render();
+    }
+};
+
+// ============================================================
+//  LOGIKA PRESENSI & PERIZINAN
+// ============================================================
+async function catatPresensi(pid, pin, aksi, foto, viaWajah = false) {
+    const p = await DB.get('pegawai', pid);
+    if (!p || p.status !== 'aktif') return { ok: false, pesan: 'Data pegawai tidak ditemukan.', kat: 'danger' };
+    if (!viaWajah && pin !== p.pin) return { ok: false, pesan: 'PIN salah. Silakan coba lagi.', kat: 'danger' };
+    const set = await DB.pengaturan();
+    const radius = Number(set.radius_meter || 0);
+    if (radius > 0 && set.sekolah_lat && set.sekolah_lng) {
+        if (K.lat === null) return { ok: false, pesan: 'Lokasi tidak terdeteksi. Aktifkan izin lokasi lalu coba lagi.', kat: 'danger' };
+        const j = jarakMeter(K.lat, K.lng, Number(set.sekolah_lat), Number(set.sekolah_lng));
+        if (j > radius) return { ok: false, pesan: `Presensi ditolak: Anda sekitar ${Math.round(j)} m dari sekolah (maks ${Math.round(radius)} m).`, kat: 'danger' };
+    }
+    const now = new Date(), jam = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0'), tgl = isoTgl(now);
+    const lokasi = K.alamat || (K.lat !== null ? `${K.lat.toFixed(5)}, ${K.lng.toFixed(5)}` : null);
+    let rec = (await DB.all('presensi')).find(r => r.pegawai_id === pid && r.tanggal === tgl);
+    if (rec && (rec.status === 'izin' || rec.status === 'sakit')) {
+        return { ok: false, pesan: `${p.nama} tercatat ${STATUS_LABEL[rec.status]} hari ini (izin disetujui), tidak perlu presensi.`, kat: 'warning' };
+    }
+
+    if (aksi === 'masuk') {
+        if (rec && rec.jam_masuk) return { ok: false, pesan: `${p.nama} sudah presensi masuk hari ini pukul ${rec.jam_masuk}.`, kat: 'warning' };
+        const status = (now.getHours() * 60 + now.getMinutes()) <= batasTerlambat(set.jam_masuk_standar, set.toleransi_menit) ? 'hadir' : 'terlambat';
+        rec = Object.assign(rec || { pegawai_id: pid, tanggal: tgl }, { jam_masuk: jam, lokasi_masuk: lokasi, lat_masuk: K.lat, lng_masuk: K.lng, foto_masuk: foto, status, waktu_catat: nowStr(), metode: viaWajah ? 'wajah' : 'pin' });
+        await DB.put('presensi', rec);
+        return { ok: true, pesan: `Presensi Masuk berhasil, ${p.nama} — pukul ${jam} (${status === 'terlambat' ? 'Terlambat' : 'Tepat Waktu'}).`, kat: status === 'terlambat' ? 'warning' : 'success', status, pegawai: p, jam };
+    }
+    if (aksi === 'pulang') {
+        if (!rec || !rec.jam_masuk) return { ok: false, pesan: `${p.nama} belum presensi masuk, belum bisa presensi pulang.`, kat: 'danger' };
+        if (rec.jam_pulang) return { ok: false, pesan: `${p.nama} sudah presensi pulang hari ini pukul ${rec.jam_pulang}.`, kat: 'warning' };
+        Object.assign(rec, { jam_pulang: jam, lokasi_pulang: lokasi, lat_pulang: K.lat, lng_pulang: K.lng, foto_pulang: foto, metode_pulang: viaWajah ? 'wajah' : 'pin' });
+        await DB.put('presensi', rec);
+        return { ok: true, pesan: `Presensi Pulang berhasil, ${p.nama} — pukul ${jam}. Sampai jumpa!`, kat: 'success', pegawai: p, jam };
+    }
+    return { ok: false, pesan: 'Aksi tidak dikenali.', kat: 'danger' };
+}
+
+async function ajukanIzin(pid, pin, jenis, mulai, selesai, alasan) {
+    const p = await DB.get('pegawai', pid);
+    if (!p || p.status !== 'aktif') return kembaliKiosk('Data pegawai tidak ditemukan.', 'danger');
+    if (pin !== p.pin) return kembaliKiosk('PIN salah. Pengajuan tidak dikirim.', 'danger');
+    const dm = parseTgl(mulai), ds = parseTgl(selesai), t0 = parseTgl(hariIni());
+    if (dm < new Date(t0.getTime() - 7 * 864e5)) return kembaliKiosk('Tanggal mulai tidak boleh lebih dari 7 hari yang lalu.', 'danger');
+    if ((ds - dm) / 864e5 > 30) return kembaliKiosk('Rentang pengajuan maksimal 31 hari.', 'danger');
+    const tabrakan = (await DB.all('perizinan')).some(z => z.pegawai_id === pid && ['menunggu', 'disetujui'].includes(z.status) && z.tanggal_mulai <= selesai && z.tanggal_selesai >= mulai);
+    if (tabrakan) return kembaliKiosk('Sudah ada pengajuan (menunggu/disetujui) pada rentang tanggal tersebut.', 'warning');
+    await DB.put('perizinan', { pegawai_id: pid, jenis, tanggal_mulai: mulai, tanggal_selesai: selesai, alasan, status: 'menunggu', diajukan_pada: nowStr() });
+    kembaliKiosk(`Pengajuan ${STATUS_LABEL[jenis]} atas nama ${p.nama} terkirim dan menunggu persetujuan Kepala Sekolah.`, 'success');
+}
+
+async function putuskanIzin(id, keputusan, catatan) {
+    const z = await DB.get('perizinan', id);
+    if (!z || z.status !== 'menunggu') { flash('Pengajuan ini sudah diputuskan sebelumnya.', 'warning'); return render(); }
+    z.status = keputusan === 'setuju' ? 'disetujui' : 'ditolak';
+    z.diputuskan_oleh = Sesi.get().nama; z.diputuskan_pada = nowStr(); z.catatan_keputusan = catatan;
+    await DB.put('perizinan', z);
+    let pesan = `Pengajuan ${z.status}.`;
+    if (z.status === 'disetujui') pesan += ` ${await terapkanPerizinan(z)} hari kerja dicatat ke presensi.`;
+    flash(pesan, z.status === 'disetujui' ? 'success' : 'warning'); render();
+}
+async function terapkanPerizinan(z) {
+    const semua = await DB.all('presensi'); let n = 0;
+    for (let cur = parseTgl(z.tanggal_mulai), akhir = parseTgl(z.tanggal_selesai); cur <= akhir; cur.setDate(cur.getDate() + 1)) {
+        if (dowSenin(cur) >= 5) continue;
+        const tgl = isoTgl(cur), rec = semua.find(r => r.pegawai_id === z.pegawai_id && r.tanggal === tgl);
+        if (rec && rec.jam_masuk) continue;
+        await DB.put('presensi', Object.assign(rec || { pegawai_id: z.pegawai_id, tanggal: tgl }, { status: z.jenis, keterangan: z.alasan, waktu_catat: nowStr() }));
+        n++;
+    }
+    return n;
+}
+
+// ============================================================
+//  HALAMAN ADMIN
+// ============================================================
+const head = (eyebrow, judul, kanan) => `<div class="page-head d-flex justify-content-between align-items-end flex-wrap gap-2"><div>${eyebrow ? `<div class="eyebrow">${eyebrow}</div>` : ''}<h3 class="mb-0">${judul}</h3></div>${kanan || ''}</div>`;
+const badgeStatus = s => `<span class="badge bg-${STATUS_BADGE[s] || 'secondary'}">${STATUS_LABEL[s] || s}</span>`;
+
+function sel(v, cocok) { return v === cocok ? 'selected' : ''; }
+function selLokasiSel(lok, lat, lng, foto, judul) {
+    let h = lok ? `<span class="badge-lokasi" title="${esc(lok)}"><i class="bi bi-geo-alt-fill"></i>${esc(potong(lok, 30))}</span>` : '—';
+    if (lat != null && lng != null) h += ` <a href="${urlPeta(lat, lng)}" target="_blank" rel="noopener" class="btn btn-outline-primary btn-sm py-0 px-1 ms-1" title="Lihat titik lokasi di peta"><i class="bi bi-map"></i> Peta</a>`;
+    if (foto) h += `<a href="#" data-act="lihatFoto" data-src="${foto}" data-judul="${esc(judul)}" class="d-block mt-1"><img src="${foto}" alt="Foto" class="foto-thumb"></a>`;
+    return h;
+}
+
+async function halDashboard() {
+    const tgl = hariIni(), [peg, pres, izin] = await Promise.all([DB.all('pegawai'), DB.all('presensi'), DB.all('perizinan')]);
+    const aktif = peg.filter(p => p.status === 'aktif'), guru = aktif.filter(p => p.jenis === 'guru').length, staf = aktif.length - guru;
+    const rekap = { hadir: 0, terlambat: 0, sakit: 0, izin: 0, alpa: 0 };
+    pres.filter(r => r.tanggal === tgl).forEach(r => rekap[r.status]++);
+    const sudah = rekap.hadir + rekap.terlambat + rekap.sakit + rekap.izin, belum = Math.max(aktif.length - sudah, 0);
+    const nama = Object.fromEntries(peg.map(p => [p.id, p]));
+    const terbaru = pres.filter(r => nama[r.pegawai_id]).sort((a, b) => (b.waktu_catat || '').localeCompare(a.waktu_catat || '')).slice(0, 10);
+    const menunggu = izin.filter(z => z.status === 'menunggu' && nama[z.pegawai_id]).sort((a, b) => b.diajukan_pada.localeCompare(a.diajukan_pada)).slice(0, 5);
+    const stat = (ikon, nilai, label) => `<div class="col-6 col-lg-3"><div class="stat-box card-x p-3 d-flex gap-3 align-items-center"><div class="icon bg-light"><i class="bi bi-${ikon}"></i></div><div><div class="value">${nilai}</div><div class="label">${label}</div></div></div></div>`;
+    return `${head('Ringkasan', 'Dashboard')}
+    <div class="row g-3 mb-4">${stat('person-workspace', guru, 'Guru aktif')}${stat('person-badge', staf, 'Staf aktif')}${stat('check2-circle', sudah, 'Sudah presensi hari ini')}${stat('hourglass-split', belum, 'Belum presensi')}</div>
+    <div class="card-x p-3 mb-4"><h6 class="fw-bold mb-3">Rekap Hari Ini — ${tglIndo(tgl)}</h6><div class="d-flex gap-2 flex-wrap">${Object.keys(rekap).map(k => `<div class="pill-status bg-${STATUS_BADGE[k]}-subtle"><div class="n">${rekap[k]}</div><div class="l">${STATUS_LABEL[k]}</div></div>`).join('')}</div></div>
+    <div class="row g-3"><div class="col-lg-5"><div class="card-x p-3 h-100"><h6 class="fw-bold mb-3"><i class="bi bi-envelope-paper me-1"></i>Pengajuan Menunggu</h6>
+        ${menunggu.length ? menunggu.map(z => `<div class="border-bottom py-2 small"><strong>${esc(nama[z.pegawai_id].nama)}</strong> — ${badgeStatus(z.jenis)}<br><span class="text-muted">${tglIndo(z.tanggal_mulai)}</span></div>`).join('') + '<a href="#/perizinan" class="btn btn-outline-secondary btn-sm mt-3">Lihat semua</a>' : '<p class="text-muted mb-0">Tidak ada pengajuan yang menunggu.</p>'}
+        <p class="small text-muted mt-3 mb-0">Guru dan staf presensi sendiri di kiosk memakai PIN, foto, GPS, dan waktu tercatat otomatis.</p></div></div>
+    <div class="col-lg-7"><div class="card-x p-3 h-100"><h6 class="fw-bold mb-3"><i class="bi bi-clock-history me-1"></i>Presensi Terbaru</h6>
+        ${terbaru.length ? `<div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Tanggal / Jam</th><th>Nama</th><th>Lokasi</th><th>Status</th></tr></thead><tbody>${terbaru.map(a => {
+            const lok = a.lokasi_pulang || a.lokasi_masuk, lat = a.lokasi_pulang ? a.lat_pulang : a.lat_masuk, lng = a.lokasi_pulang ? a.lng_pulang : a.lng_masuk;
+            return `<tr><td class="small">${a.tanggal} ${a.jam_pulang || a.jam_masuk || ''}</td><td>${esc(nama[a.pegawai_id].nama)}</td><td class="small">${lok ? `<span class="badge-lokasi" title="${esc(lok)}"><i class="bi bi-geo-alt-fill"></i>${esc(potong(lok, 24))}</span>` : '—'}${lat != null && lng != null ? ` <a href="${urlPeta(lat, lng)}" target="_blank" rel="noopener" class="btn btn-outline-primary btn-sm py-0 px-1 ms-1" title="Lihat titik lokasi di peta"><i class="bi bi-map"></i></a>` : ''}</td><td>${badgeStatus(a.status)}</td></tr>`;
+        }).join('')}</tbody></table></div>` : '<p class="text-muted mb-0">Belum ada presensi yang tercatat.</p>'}</div></div></div>`;
+}
+
+async function halRiwayat() {
+    const par = rutePar; let awal = par.tanggal_awal || '', akhir = par.tanggal_akhir || '';
+    if (!awal && !akhir) { akhir = hariIni(); const d = new Date(); d.setDate(d.getDate() - 13); awal = isoTgl(d); }
+    const [peg, pres] = await Promise.all([DB.all('pegawai'), DB.all('presensi')]);
+    const nama = Object.fromEntries(peg.map(p => [p.id, p]));
+    const data = pres.filter(r => nama[r.pegawai_id] && (!awal || r.tanggal >= awal) && (!akhir || r.tanggal <= akhir) && (!par.pegawai_id || String(r.pegawai_id) === par.pegawai_id) && (!STATUS_LABEL[par.status] || r.status === par.status))
+        .sort((a, b) => b.tanggal.localeCompare(a.tanggal) || (b.jam_masuk || '').localeCompare(a.jam_masuk || ''));
+    return `${head('Histori', 'Riwayat Presensi')}
+    <form data-form="filter" data-rute="/riwayat" class="row g-2 mb-3 align-items-end">
+        <div class="col-md-2"><label class="form-label small mb-1">Dari Tanggal</label><input type="date" name="tanggal_awal" value="${awal}" class="form-control form-control-sm"></div>
+        <div class="col-md-2"><label class="form-label small mb-1">Sampai Tanggal</label><input type="date" name="tanggal_akhir" value="${akhir}" class="form-control form-control-sm"></div>
+        <div class="col-md-3"><label class="form-label small mb-1">Guru / Staf</label><select name="pegawai_id" class="form-select form-select-sm"><option value="">Semua</option>${peg.sort((a, b) => a.nama.localeCompare(b.nama)).map(p => `<option value="${p.id}" ${par.pegawai_id === String(p.id) ? 'selected' : ''}>${esc(p.nama)}</option>`).join('')}</select></div>
+        <div class="col-md-2"><label class="form-label small mb-1">Status</label><select name="status" class="form-select form-select-sm"><option value="">Semua</option>${Object.entries(STATUS_LABEL).map(([k, v]) => `<option value="${k}" ${par.status === k ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
+        <div class="col-md-2"><button type="submit" class="btn btn-brand btn-sm w-100"><i class="bi bi-filter"></i> Filter</button></div></form>
+    <div class="card-x p-3"><div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Tanggal</th><th>Nama</th><th>Masuk</th><th>Lokasi Masuk</th><th>Pulang</th><th>Lokasi Pulang</th><th>Status</th><th>Keterangan</th></tr></thead><tbody>
+    ${data.length ? data.map(a => { const p = nama[a.pegawai_id]; return `<tr><td class="small">${tglIndo(a.tanggal)}</td><td>${esc(p.nama)}${(a.metode === 'wajah' || a.metode_pulang === 'wajah') ? ' <span class="badge bg-info-subtle text-info border border-info-subtle py-0" style="font-size:0.68rem;" title="Presensi Wajah"><i class="bi bi-person-bounding-box me-1"></i>Wajah</span>' : ''}<div class="small text-muted">${kode(p)} · ${p.jenis === 'guru' ? 'Guru' : 'Staf'}</div></td>
+        <td class="small">${a.jam_masuk || '-'}</td><td class="small">${selLokasiSel(a.lokasi_masuk, a.lat_masuk, a.lng_masuk, a.foto_masuk, `${p.nama} — Masuk ${a.tanggal} ${a.jam_masuk || ''}`)}</td>
+        <td class="small">${a.jam_pulang || '-'}</td><td class="small">${selLokasiSel(a.lokasi_pulang, a.lat_pulang, a.lng_pulang, a.foto_pulang, `${p.nama} — Pulang ${a.tanggal} ${a.jam_pulang || ''}`)}</td>
+        <td>${badgeStatus(a.status)}</td><td class="small">${esc(a.keterangan || '-')}</td></tr>`; }).join('') : '<tr><td colspan="8" class="text-center text-muted py-4">Tidak ada data pada rentang tanggal ini.</td></tr>'}
+    </tbody></table></div></div>`;
+}
+
+async function halPerizinan() {
+    const s = Sesi.get(), status = ['menunggu', 'disetujui', 'ditolak', 'semua'].includes(rutePar.status) ? rutePar.status : 'menunggu';
+    const [peg, izin] = await Promise.all([DB.all('pegawai'), DB.all('perizinan')]);
+    const nama = Object.fromEntries(peg.map(p => [p.id, p]));
+    const data = izin.filter(z => nama[z.pegawai_id] && (status === 'semua' || z.status === status))
+        .sort((a, b) => (b.status === 'menunggu') - (a.status === 'menunggu') || b.diajukan_pada.localeCompare(a.diajukan_pada));
+    return `${head('Sakit &amp; Izin', 'Perizinan')}
+    <div class="alert alert-light border small"><i class="bi bi-diagram-3 me-1"></i>Alur: pegawai mengajukan di kiosk <i class="bi bi-arrow-right"></i> <strong>Kepala Sekolah</strong> menyetujui/menolak <i class="bi bi-arrow-right"></i> bila disetujui, status tercatat otomatis pada presensi hari kerja yang diajukan.${s.role !== 'kepala_sekolah' ? '<br>Anda login sebagai Administrator: dapat melihat, tetapi keputusan hanya oleh Kepala Sekolah.' : ''}</div>
+    <div class="mb-3 d-flex gap-2 flex-wrap">${[['menunggu', 'Menunggu'], ['disetujui', 'Disetujui'], ['ditolak', 'Ditolak'], ['semua', 'Semua']].map(([k, l]) => `<a href="#/perizinan?status=${k}" class="btn btn-sm ${status === k ? 'btn-brand' : 'btn-outline-secondary'}">${l}</a>`).join('')}</div>
+    <div class="card-x p-3">${data.length ? `<div class="table-responsive"><table class="table align-middle mb-0"><thead><tr><th>Diajukan</th><th>Pegawai</th><th>Jenis</th><th>Tanggal</th><th>Alasan</th><th>Status</th><th></th></tr></thead><tbody>
+    ${data.map(z => { const p = nama[z.pegawai_id]; return `<tr><td class="small text-muted">${z.diajukan_pada.slice(0, 16)}</td><td><div class="fw-medium">${esc(p.nama)}</div><div class="small text-muted">${kode(p)} · ${esc(p.jabatan || '-')}</div></td>
+        <td>${badgeStatus(z.jenis)}</td><td class="small">${tglIndo(z.tanggal_mulai)}${z.tanggal_selesai !== z.tanggal_mulai ? '<br>s/d ' + tglIndo(z.tanggal_selesai) : ''}</td><td class="small" style="max-width:260px;">${esc(z.alasan)}</td>
+        <td>${z.status === 'menunggu' ? '<span class="badge text-bg-warning">Menunggu</span>' : z.status === 'disetujui' ? '<span class="badge text-bg-success">Disetujui</span>' : '<span class="badge text-bg-danger">Ditolak</span>'}${z.diputuskan_oleh ? `<div class="small text-muted">${esc(z.diputuskan_oleh)}<br>${z.diputuskan_pada.slice(0, 16)}</div>` : ''}${z.catatan_keputusan ? `<div class="small fst-italic">“${esc(z.catatan_keputusan)}”</div>` : ''}</td>
+        <td class="text-end">${z.status === 'menunggu' && s.role === 'kepala_sekolah' ? `<button class="btn btn-sm btn-brand" data-act="prosesIzin" data-id="${z.id}">Proses</button>` : ''}</td></tr>`; }).join('')}
+    </tbody></table></div>` : '<p class="text-muted text-center py-4 mb-0">Tidak ada pengajuan.</p>'}</div>`;
+}
+
+async function halPegawai() {
+    const q = (rutePar.q || '').trim().toLowerCase(), jenis = rutePar.jenis || '';
+    let peg = (await DB.all('pegawai')).sort((a, b) => a.nama.localeCompare(b.nama));
+    peg = peg.filter(p => (!jenis || p.jenis === jenis) && (!q || p.nama.toLowerCase().includes(q) || (p.nip || '').toLowerCase().includes(q) || kode(p).toLowerCase().includes(q)));
+    return `${head('Data Induk', 'Guru &amp; Staf', '<button class="btn btn-brand btn-sm" data-act="formPegawai"><i class="bi bi-plus-lg me-1"></i>Tambah</button>')}
+    <form data-form="filter" data-rute="/pegawai" class="row g-2 mb-3"><div class="col-md-5"><input name="q" value="${esc(rutePar.q || '')}" class="form-control" placeholder="Cari nama, NIP, atau ID..."></div>
+        <div class="col-md-3"><select name="jenis" class="form-select"><option value="">Guru &amp; Staf</option><option value="guru" ${sel(jenis, 'guru')}>Guru</option><option value="staf" ${sel(jenis, 'staf')}>Staf</option></select></div>
+        <div class="col-md-2"><button class="btn btn-outline-secondary w-100"><i class="bi bi-search"></i> Cari</button></div></form>
+    <div class="card-x p-3"><div class="table-responsive"><table class="table align-middle mb-0"><thead><tr><th>No</th><th>ID</th><th>Nama</th><th>NIP</th><th>Kelompok</th><th>Jabatan / Bidang</th><th>PIN</th><th>Wajah</th><th>Status</th><th></th></tr></thead><tbody>
+    ${peg.length ? peg.map((p, i) => `<tr><td class="text-muted small">${i + 1}</td><td><code>${kode(p)}</code></td>
+        <td><div class="d-flex align-items-center gap-2">${p.face_photo ? `<img src="${p.face_photo}" style="width:28px;height:28px;border-radius:50%;object-fit:cover;">` : ''}<span class="fw-medium">${esc(p.nama)}</span></div></td>
+        <td>${esc(p.nip || '-')}</td>
+        <td><span class="badge bg-${p.jenis === 'guru' ? 'primary' : 'success'}">${p.jenis === 'guru' ? 'Guru' : 'Staf'}</span></td><td>${esc(p.jabatan || '-')}</td><td><code>${esc(p.pin)}</code></td>
+        <td>${p.face_descriptor ? '<span class="badge bg-success-subtle text-success border border-success-subtle" title="Wajah terdaftar"><i class="bi bi-check-circle-fill me-1"></i>Terdaftar</span>' : '<span class="badge bg-secondary-subtle text-secondary border" title="Belum didaftarkan"><i class="bi bi-dash-circle me-1"></i>Belum</span>'}</td>
+        <td>${p.status === 'aktif' ? '<span class="badge bg-success">Aktif</span>' : '<span class="badge bg-secondary">Nonaktif</span>'}</td>
+        <td class="text-end">
+            <button class="btn btn-sm btn-outline-primary" data-act="bukaDaftarWajahAdmin" data-id="${p.id}" title="Daftarkan / Kelola Wajah"><i class="bi bi-person-bounding-box"></i></button>
+            <button class="btn btn-sm btn-outline-secondary" data-act="formPegawai" data-id="${p.id}" title="Edit"><i class="bi bi-pencil"></i></button>
+            <button class="btn btn-sm btn-outline-danger" data-act="hapusPegawai" data-id="${p.id}" title="Hapus"><i class="bi bi-trash"></i></button>
+        </td></tr>`).join('')
+        : '<tr><td colspan="10" class="text-center text-muted py-4">Belum ada data. Klik "Tambah" untuk menambahkan guru atau staf.</td></tr>'}</tbody></table></div></div>`;
+}
+
+async function bukaFormPegawai(id) {
+    const p = id ? await DB.get('pegawai', id) : { nama: '', nip: '', jenis: 'guru', jabatan: '', pin: '', status: 'aktif' };
+    tampilModal(id ? 'Edit Guru / Staf' : 'Tambah Guru / Staf', `
+        <div class="mb-2"><label class="form-label small">Nama</label><input name="nama" class="form-control" value="${esc(p.nama)}" required></div>
+        <div class="mb-2"><label class="form-label small">NIP (opsional)</label><input name="nip" class="form-control" value="${esc(p.nip || '')}"></div>
+        <div class="row g-2 mb-2"><div class="col-6"><label class="form-label small">Kelompok</label><select name="jenis" class="form-select"><option value="guru" ${sel(p.jenis, 'guru')}>Guru</option><option value="staf" ${sel(p.jenis, 'staf')}>Staf</option></select></div>
+        <div class="col-6"><label class="form-label small">PIN (4 digit)</label><input name="pin" class="form-control" value="${esc(p.pin)}" pattern="\\d{4}" maxlength="4" required></div></div>
+        <div class="mb-2"><label class="form-label small">Jabatan / Bidang</label><input name="jabatan" class="form-control" value="${esc(p.jabatan)}"></div>
+        <div class="mb-2"><label class="form-label small">Status</label><select name="status" class="form-select"><option value="aktif" ${sel(p.status, 'aktif')}>Aktif</option><option value="nonaktif" ${sel(p.status, 'nonaktif')}>Nonaktif</option></select></div>
+        ${id ? `<div class="p-2 border rounded bg-light small d-flex justify-content-between align-items-center">
+            <span><i class="bi bi-person-bounding-box me-1"></i> Data Wajah: ${p.face_descriptor ? '<strong class="text-success">Sudah Terdaftar</strong>' : '<span class="text-muted">Belum ada</span>'}</span>
+            <button type="button" class="btn btn-sm btn-outline-primary" data-act="bukaDaftarWajahAdmin" data-id="${p.id}"><i class="bi bi-camera me-1"></i>${p.face_descriptor ? 'Ubah Wajah' : 'Daftarkan Wajah'}</button>
+        </div>` : ''}`, {
+        onOk: async fd => {
+            const pin = (fd.get('pin') || '').trim();
+            if (!/^\d{4}$/.test(pin)) { alert('PIN harus 4 digit angka.'); return false; }
+            const baru = Object.assign(p, { nama: fd.get('nama').trim(), nip: fd.get('nip').trim() || null, jenis: fd.get('jenis'), jabatan: fd.get('jabatan').trim(), pin, status: fd.get('status') });
+            if (!id) baru.created_at = nowStr();
+            await DB.put('pegawai', baru); flash(`Data '${baru.nama}' berhasil ${id ? 'diperbarui' : 'ditambahkan'}.`, 'success'); render();
+        }
+    });
+}
+
+// ---------- laporan ----------
+function paramLaporan() {
+    const h = new Date(); let tahun = parseInt(rutePar.tahun) || h.getFullYear(), bulan = parseInt(rutePar.bulan) || h.getMonth() + 1;
+    if (bulan < 1 || bulan > 12 || tahun < 2000 || tahun > 2100) { tahun = h.getFullYear(); bulan = h.getMonth() + 1; }
+    return { tahun, bulan, q: (rutePar.q || '').trim(), pid: parseInt(rutePar.pegawai_id) || null };
+}
+function rekapBulanan(peg, pres, tahun, bulan) {
+    const akhirBulan = new Date(tahun, bulan, 0), awal = new Date(tahun, bulan - 1, 1), batas = akhirBulan < new Date() ? akhirBulan : new Date();
+    const awalS = isoTgl(awal), akhirS = isoTgl(akhirBulan), tercatat = {};
+    pres.filter(r => r.tanggal >= awalS && r.tanggal <= akhirS).forEach(r => tercatat[r.pegawai_id + '|' + r.tanggal] = r.status);
+    const hariKerja = [];
+    for (let c = new Date(awal); c <= batas; c.setDate(c.getDate() + 1)) if (dowSenin(c) < 5) hariKerja.push(isoTgl(c));
+    return peg.filter(p => p.status === 'aktif').sort((a, b) => a.jenis.localeCompare(b.jenis) || a.nama.localeCompare(b.nama)).map(p => {
+        const r = { hadir: 0, terlambat: 0, sakit: 0, izin: 0, alpa: 0 }, mulai = (p.created_at || '').slice(0, 10) > awalS ? p.created_at.slice(0, 10) : awalS;
+        hariKerja.forEach(t => { if (t < mulai) return; const st = tercatat[p.id + '|' + t]; r[st || 'alpa']++; });
+        return Object.assign({ pegawai: p }, r, { total: r.hadir + r.terlambat + r.sakit + r.izin + r.alpa });
+    });
+}
+function filterRekap(h, q, pid) {
+    if (pid) h = h.filter(r => r.pegawai.id === pid);
+    if (q) { const k = q.toLowerCase(); h = h.filter(r => r.pegawai.nama.toLowerCase().includes(k) || (r.pegawai.nip || '').toLowerCase().includes(k) || kode(r.pegawai).toLowerCase().includes(k)); }
+    return h;
+}
+function rincianHarian(p, pres, tahun, bulan) {
+    const akhirBulan = new Date(tahun, bulan, 0), batas = akhirBulan < new Date() ? akhirBulan : new Date(), awalS = isoTgl(new Date(tahun, bulan - 1, 1));
+    const ada = Object.fromEntries(pres.filter(r => r.pegawai_id === p.id).map(r => [r.tanggal, r]));
+    const mulai = (p.created_at || '').slice(0, 10) > awalS ? p.created_at.slice(0, 10) : awalS, hasil = [];
+    for (let c = new Date(tahun, bulan - 1, 1); c <= akhirBulan; c.setDate(c.getDate() + 1)) {
+        const t = isoTgl(c), rec = ada[t], hari = NAMA_HARI_MULAI_SENIN[dowSenin(c)];
+        if (rec) hasil.push({ tanggal: t, hari, status: rec.status, jam_masuk: rec.jam_masuk, jam_pulang: rec.jam_pulang, lokasi: rec.lokasi_masuk, keterangan: rec.keterangan });
+        else if (dowSenin(c) < 5 && t >= mulai && c <= batas) hasil.push({ tanggal: t, hari, status: 'alpa' });
+    }
+    return hasil;
+}
+async function halLaporan() {
+    const { tahun, bulan, q, pid } = paramLaporan(), [peg, pres] = await Promise.all([DB.all('pegawai'), DB.all('presensi')]);
+    const hasil = filterRekap(rekapBulanan(peg, pres, tahun, bulan), q, pid), pilih = pid ? peg.find(p => p.id === pid) : null, rinci = pilih ? rincianHarian(pilih, pres, tahun, bulan) : [];
+    const awalS = isoTgl(new Date(tahun, bulan - 1, 1)), akhirS = isoTgl(new Date(tahun, bulan, 0));
+    return `${head('Rekap Bulanan', 'Laporan', `<button class="btn btn-brand btn-sm" data-act="unduhPdf"><i class="bi bi-file-earmark-pdf me-1"></i>Unduh PDF${pilih ? ' (individu)' : ''}</button>`)}
+    <form data-form="filter" data-rute="/laporan" class="row g-2 mb-3 align-items-end">
+        <div class="col-md-3"><label class="form-label small mb-1">Bulan</label><select name="bulan" class="form-select">${NAMA_BULAN.slice(1).map((n, i) => `<option value="${i + 1}" ${i + 1 === bulan ? 'selected' : ''}>${n}</option>`).join('')}</select></div>
+        <div class="col-md-2"><label class="form-label small mb-1">Tahun</label><input type="number" name="tahun" value="${tahun}" class="form-control"></div>
+        <div class="col-md-5"><label class="form-label small mb-1">Cari Guru/Staf (nama, NIP, atau ID)</label><div class="input-group"><span class="input-group-text"><i class="bi bi-search"></i></span><input name="q" value="${esc(q)}" class="form-control" placeholder="cth. Siti, G001, 1980..."></div></div>
+        <div class="col-md-2 d-flex gap-1"><button class="btn btn-brand flex-fill">Cari</button>${q || pid ? `<a href="#/laporan?bulan=${bulan}&tahun=${tahun}" class="btn btn-outline-secondary" title="Reset"><i class="bi bi-x-lg"></i></a>` : ''}</div></form>
+    <p class="text-muted mb-3">Periode ${tglIndo(awalS)} sampai ${tglIndo(akhirS)}</p>
+    <div class="card-x p-3 mb-4"><div class="table-responsive"><table class="table align-middle mb-0"><thead><tr><th>No</th><th>ID</th><th>Nama</th><th>Kelompok</th><th>Jabatan</th><th class="text-center">Hadir</th><th class="text-center">Terlambat</th><th class="text-center">Sakit</th><th class="text-center">Izin</th><th class="text-center">Alpa</th><th class="text-center">Total</th><th></th></tr></thead><tbody>
+    ${hasil.length ? hasil.map((r, i) => `<tr ${pid === r.pegawai.id ? 'class="table-active"' : ''}><td class="text-muted small">${i + 1}</td><td><code>${kode(r.pegawai)}</code></td><td class="fw-medium">${esc(r.pegawai.nama)}</td><td>${r.pegawai.jenis === 'guru' ? 'Guru' : 'Staf'}</td><td>${esc(r.pegawai.jabatan || '-')}</td>
+        <td class="text-center">${r.hadir}</td><td class="text-center">${r.terlambat}</td><td class="text-center">${r.sakit}</td><td class="text-center">${r.izin}</td><td class="text-center">${r.alpa}</td><td class="text-center fw-bold">${r.total}</td>
+        <td class="text-end"><a class="btn btn-sm btn-outline-secondary" href="#/laporan?bulan=${bulan}&tahun=${tahun}&pegawai_id=${r.pegawai.id}">Rincian</a></td></tr>`).join('') : '<tr><td colspan="12" class="text-center text-muted py-4">Tidak ada data pegawai yang sesuai.</td></tr>'}</tbody></table></div></div>
+    ${pilih ? `<div class="card-x p-3"><h6 class="fw-bold mb-1"><i class="bi bi-person-lines-fill me-1"></i>Rincian Kehadiran — ${esc(pilih.nama)}</h6><p class="small text-muted mb-3">${kode(pilih)} · ${esc(pilih.jabatan || '-')} · NIP ${esc(pilih.nip || '-')}</p>
+    <div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Tanggal</th><th>Hari</th><th>Jam Masuk</th><th>Jam Pulang</th><th>Status</th><th>Lokasi Masuk</th><th>Keterangan</th></tr></thead><tbody>
+    ${rinci.length ? rinci.map(r => `<tr><td class="small">${r.tanggal}</td><td class="small">${r.hari}</td><td>${r.jam_masuk || '-'}</td><td>${r.jam_pulang || '-'}</td><td>${badgeStatus(r.status)}</td><td class="small">${r.lokasi ? esc(potong(r.lokasi, 36)) : '—'}</td><td class="small">${esc(r.keterangan || '-')}</td></tr>`).join('') : '<tr><td colspan="7" class="text-center text-muted py-3">Belum ada data pada bulan ini.</td></tr>'}</tbody></table></div></div>` : ''}`;
+}
+
+async function unduhLaporanPdf() {
+    if (!window.jspdf) { alert('Pustaka PDF belum termuat. Periksa koneksi internet lalu coba lagi.'); return; }
+    const { tahun, bulan, q, pid } = paramLaporan(), [peg, pres, set] = await Promise.all([DB.all('pegawai'), DB.all('presensi'), DB.pengaturan()]);
+    const hasil = filterRekap(rekapBulanan(peg, pres, tahun, bulan), q, pid), pilih = pid ? peg.find(p => p.id === pid) : null;
+    const doc = new jspdf.jsPDF({ unit: 'mm', format: 'a4' }), navy = [27, 58, 92], W = 210;
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(10); doc.setTextColor(85); doc.text(set.nama_sekolah.toUpperCase(), W / 2, 15, { align: 'center' });
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(15); doc.setTextColor(...navy);
+    doc.text(pilih ? 'RIWAYAT KEHADIRAN INDIVIDU' : 'REKAP PRESENSI GURU & STAF', W / 2, 23, { align: 'center' });
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(10); doc.setTextColor(85);
+    doc.text(`Bulan ${NAMA_BULAN[bulan]} ${tahun}` + (!pilih && q ? ` - pencarian: "${q}"` : ''), W / 2, 29, { align: 'center' });
+    let y = 35;
+    const gaya = { headStyles: { fillColor: navy, textColor: 255, fontSize: 8.5 }, styles: { fontSize: 8.5, cellPadding: 1.8, lineColor: [204, 204, 204], lineWidth: 0.1 }, alternateRowStyles: { fillColor: [240, 242, 245] }, margin: { left: 12, right: 12 } };
+    if (pilih) {
+        doc.setTextColor(0); doc.setFontSize(9.5);
+        [['ID', kode(pilih)], ['Nama', pilih.nama], ['NIP', pilih.nip || '-'], ['Jabatan', `${pilih.jabatan || '-'} (${pilih.jenis === 'guru' ? 'Guru' : 'Staf'})`]].forEach(([k, v], i) => { doc.text(k, 12, y + i * 5); doc.text(': ' + v, 32, y + i * 5); });
+        y += 24;
+        const rinci = rincianHarian(pilih, pres, tahun, bulan);
+        if (!rinci.length) { doc.text('Belum ada data kehadiran pada bulan ini.', 12, y); y += 6; }
+        else {
+            doc.autoTable(Object.assign({ startY: y, head: [['No', 'Tanggal', 'Hari', 'Jam Masuk', 'Jam Pulang', 'Status', 'Keterangan']],
+                body: rinci.map((r, i) => [i + 1, parseTgl(r.tanggal).toLocaleDateString('id-ID', { day: '2-digit', month: '2-digit', year: 'numeric' }), r.hari, r.jam_masuk || '-', r.jam_pulang || '-', STATUS_LABEL[r.status], r.keterangan || '']),
+                columnStyles: { 0: { halign: 'center' }, 3: { halign: 'center' }, 4: { halign: 'center' }, 5: { halign: 'center' } } }, gaya));
+            y = doc.lastAutoTable.finalY + 6;
+            const rg = hasil.find(r => r.pegawai.id === pilih.id);
+            if (rg) { doc.setFontSize(9.5); doc.setTextColor(0); doc.text(`Ringkasan: Hadir ${rg.hadir} | Terlambat ${rg.terlambat} | Sakit ${rg.sakit} | Izin ${rg.izin} | Alpa ${rg.alpa}`, 12, y); y += 4; }
+        }
+    } else if (!hasil.length) { doc.setTextColor(0); doc.text('Tidak ada data pegawai yang sesuai.', 12, y); y += 6; }
+    else {
+        doc.autoTable(Object.assign({ startY: y, head: [['No', 'ID', 'Nama', 'Jenis', 'Jabatan', 'Hadir', 'Terlambat', 'Sakit', 'Izin', 'Alpa', 'Total']],
+            body: hasil.map((r, i) => [i + 1, kode(r.pegawai), r.pegawai.nama, r.pegawai.jenis === 'guru' ? 'Guru' : 'Staf', r.pegawai.jabatan || '-', r.hadir, r.terlambat, r.sakit, r.izin, r.alpa, r.total]),
+            columnStyles: { 0: { halign: 'center' }, 3: { halign: 'center' }, 5: { halign: 'center' }, 6: { halign: 'center' }, 7: { halign: 'center' }, 8: { halign: 'center' }, 9: { halign: 'center' }, 10: { halign: 'center' } } }, gaya));
+        y = doc.lastAutoTable.finalY + 4;
+    }
+    // kolom pengesahan
+    if (y + 52 > 285) { doc.addPage(); y = 20; }
+    y += 8; const n = new Date(), kota = set.kota || '...............', cx1 = 55, cx2 = 155;
+    doc.setFontSize(9.5); doc.setTextColor(0); doc.setFont('helvetica', 'normal');
+    doc.text(`${kota}, ${n.getDate()} ${NAMA_BULAN[n.getMonth() + 1]} ${n.getFullYear()}`, cx2, y, { align: 'center' });
+    doc.text('Dibuat oleh,', cx1, y + 5, { align: 'center' }); doc.text('Mengesahkan,', cx2, y + 5, { align: 'center' });
+    doc.text('Administrator', cx1, y + 10, { align: 'center' }); doc.text('Kepala Sekolah', cx2, y + 10, { align: 'center' });
+    const yt = y + 32, nama = set.nama_kepala_sekolah || '(...........................................)';
+    doc.text('(...........................................)', cx1, yt, { align: 'center' });
+    doc.text(nama, cx2, yt, { align: 'center' }); doc.line(cx2 - doc.getTextWidth(nama) / 2, yt + 0.8, cx2 + doc.getTextWidth(nama) / 2, yt + 0.8);
+    doc.text(set.nip_kepala_sekolah ? `NIP. ${set.nip_kepala_sekolah}` : 'NIP. .............................', cx2, yt + 5, { align: 'center' });
+    doc.setFontSize(8); doc.setTextColor(150);
+    doc.text(`Dicetak pada: ${n.toLocaleString('id-ID')}`, 12, yt + 14);
+    doc.save(pilih ? `riwayat ${kode(pilih)} ${NAMA_BULAN[bulan].toLowerCase()} ${tahun}.pdf` : `rekap presensi ${NAMA_BULAN[bulan].toLowerCase()} ${tahun}.pdf`);
+}
+
+async function halPengaturan() {
+    const p = await DB.pengaturan();
+    return `${head('', 'Pengaturan')}
+    <div class="card-x p-4" style="max-width:560px;"><form data-form="pengaturan">
+        <div class="mb-3"><label class="form-label small">Nama Sekolah</label><input name="nama_sekolah" class="form-control" value="${esc(p.nama_sekolah)}"><div class="form-text">Ditampilkan di halaman Kiosk.</div></div>
+        <div class="row g-3 mb-3"><div class="col-6"><label class="form-label small">Jam Masuk Standar</label><input type="time" name="jam_masuk_standar" class="form-control" value="${esc(p.jam_masuk_standar)}" required></div>
+        <div class="col-6"><label class="form-label small">Toleransi Keterlambatan (menit)</label><input type="number" name="toleransi_menit" class="form-control" value="${esc(p.toleransi_menit)}" min="0" required></div></div>
+        <hr class="my-4"><h6 class="fw-bold mb-2"><i class="bi bi-geo-alt-fill me-1"></i>Batas Lokasi Presensi (Opsional)</h6>
+        <p class="small text-muted">Jika diisi, presensi hanya bisa dilakukan dalam radius tertentu dari titik lokasi sekolah. Kosongkan / isi 0 untuk menonaktifkan.</p>
+        <div class="row g-3 mb-2"><div class="col-6"><label class="form-label small">Latitude Sekolah</label><input name="sekolah_lat" id="sekolahLat" class="form-control" value="${esc(p.sekolah_lat)}" placeholder="cth. -5.5975"></div>
+        <div class="col-6"><label class="form-label small">Longitude Sekolah</label><input name="sekolah_lng" id="sekolahLng" class="form-control" value="${esc(p.sekolah_lng)}" placeholder="cth. 106.5967"></div></div>
+        <button type="button" class="btn btn-outline-secondary btn-sm mb-3" data-act="gunakanLokasi"><i class="bi bi-crosshair me-1"></i>Gunakan Lokasi Perangkat Ini</button>
+        <div class="mb-3"><label class="form-label small">Radius Maksimal (meter)</label><input type="number" name="radius_meter" class="form-control" value="${esc(p.radius_meter)}" min="0" style="max-width:200px;"></div>
+        <hr class="my-4"><h6 class="fw-bold mb-2"><i class="bi bi-patch-check me-1"></i>Pengesahan Laporan</h6><p class="small text-muted">Dicetak pada kolom tanda tangan di laporan PDF.</p>
+        <div class="row g-3 mb-3"><div class="col-md-5"><label class="form-label small">Nama Kepala Sekolah</label><input name="nama_kepala_sekolah" class="form-control" value="${esc(p.nama_kepala_sekolah)}"></div>
+        <div class="col-md-4"><label class="form-label small">NIP Kepala Sekolah</label><input name="nip_kepala_sekolah" class="form-control" value="${esc(p.nip_kepala_sekolah)}"></div>
+        <div class="col-md-3"><label class="form-label small">Kota</label><input name="kota" class="form-control" value="${esc(p.kota)}" placeholder="cth. Jakarta"></div></div>
+        <button type="submit" class="btn btn-brand"><i class="bi bi-save me-1"></i>Simpan Pengaturan</button></form></div>
+    <div class="card-x p-4 mt-4" style="max-width:560px;"><h6 class="fw-bold mb-2"><i class="bi bi-hdd me-1"></i>Cadangan Data</h6>
+        <p class="small text-muted">Versi GitHub Pages menyimpan data di browser perangkat ini (tidak otomatis tersinkron ke perangkat lain). Unduh cadangan secara berkala, dan pulihkan bila berpindah perangkat.</p>
+        <div class="d-flex gap-2 flex-wrap"><button class="btn btn-outline-secondary btn-sm" data-act="cadangkan"><i class="bi bi-download me-1"></i>Unduh Cadangan</button>
+        <button class="btn btn-outline-secondary btn-sm" data-act="pulihkan"><i class="bi bi-upload me-1"></i>Pulihkan dari Cadangan</button>
+        <button class="btn btn-outline-danger btn-sm" data-act="resetData"><i class="bi bi-trash me-1"></i>Reset Data</button></div>
+        <input type="file" id="fileCadangan" accept="application/json" hidden></div>`;
+}
+document.addEventListener('change', async ev => {
+    if (ev.target.id !== 'fileCadangan' || !ev.target.files[0]) return;
+    try {
+        const dump = JSON.parse(await ev.target.files[0].text());
+        if (!STORES.every(s => Array.isArray(dump[s]))) throw new Error('Format file cadangan tidak dikenali.');
+        for (const s of STORES) { await DB.clear(s); for (const o of dump[s]) await DB.put(s, o); }
+        Sesi.clear(); flash('Data berhasil dipulihkan. Silakan login kembali.', 'success'); nav('/login');
+    } catch (e) { alert('Gagal memulihkan: ' + e.message); }
+});
+
+async function halAkun() {
+    const users = (await DB.all('users')).sort((a, b) => a.username.localeCompare(b.username));
+    return `${head('', 'Kelola Akun')}
+    <div class="row g-3"><div class="col-lg-7"><div class="card-x p-3"><table class="table align-middle mb-0"><thead><tr><th>Username</th><th>Nama</th><th>Peran</th><th></th></tr></thead><tbody>
+    ${users.map(u => `<tr><td><code>${esc(u.username)}</code></td><td>${esc(u.nama_lengkap)}</td><td>${u.role === 'kepala_sekolah' ? 'Kepala Sekolah' : 'Administrator'}</td>
+        <td class="text-end"><button class="btn btn-sm btn-outline-secondary" data-act="resetAkun" data-id="${u.id}" title="Reset password"><i class="bi bi-key"></i></button> <button class="btn btn-sm btn-outline-danger" data-act="hapusAkun" data-id="${u.id}" title="Hapus"><i class="bi bi-trash"></i></button></td></tr>`).join('')}</tbody></table></div></div>
+    <div class="col-lg-5"><div class="card-x p-3"><h6 class="fw-bold mb-3">Tambah Akun</h6><form data-form="akunBaru">
+        <div class="mb-2"><input name="username" class="form-control" placeholder="Username" required></div><div class="mb-2"><input name="nama_lengkap" class="form-control" placeholder="Nama lengkap" required></div>
+        <div class="mb-2"><input type="password" name="password" class="form-control" placeholder="Password (min. 4 karakter)" required></div>
+        <div class="mb-3"><select name="role" class="form-select"><option value="admin">Administrator</option><option value="kepala_sekolah">Kepala Sekolah</option></select></div>
+        <button class="btn btn-brand w-100">Tambah</button></form></div></div></div>`;
+}
+
+// ---------- mulai ----------
+(async function init() {
+    try {
+        if (!window.indexedDB || !window.crypto || !crypto.subtle) throw new Error('Browser tidak mendukung penyimpanan lokal atau memerlukan HTTPS.');
+        await DB.open(); await seedAwal(); await render();
+    } catch (e) { $('#app').innerHTML = `<div class="page-wrap"><div class="alert alert-danger">${esc(e.message)}</div></div>`; }
+})();
